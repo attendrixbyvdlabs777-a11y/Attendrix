@@ -1,0 +1,352 @@
+/* ATTENDRIX – app logic: routing, Firebase sign-in, actions, dialogs */
+const app = $('#app');
+const B = window.AttendrixBackend;
+
+const parseRoute = () => (location.hash || '#/').replace(/^#\/?/, '').split('/').filter(Boolean);
+const replaceHash = h => location.replace(h);
+function setView(role, view) { State.role = role; State.view = NAV[role].some(n => n[0] === view) ? view : 'dashboard'; }
+
+/* One function decides what is on screen, from the URL and the sign-in state. */
+function render() {
+  const p = parseRoute(), a = State.auth;
+
+  // Demo: sample data, no sign-in, clearly labelled.
+  if (p[0] === 'demo' && NAV[p[1]]) {
+    if (!State.demo) { State.demo = true; loadData(true); }
+    setView(p[1], p[2]);
+    app.innerHTML = shell(currentView());
+    return;
+  }
+  if (State.demo) { State.demo = false; loadData(false); }
+
+  if (p[0] === 'login' && (p[1] === 'faculty' || p[1] === 'student')) {
+    if (a.status === 'signedIn') {
+      const target = p[1] === 'student' ? 'student' : firstStaffRole();
+      if (target) return replaceHash(`#/app/${target}/dashboard`);
+      app.innerHTML = deniedView('faculty');
+      return;
+    }
+    app.innerHTML = loginView(p[1]);
+    return;
+  }
+
+  if (p[0] === 'app') {
+    if (a.status === 'loading') { app.innerHTML = loadingView('Checking your sign-in…'); return; }
+    if (a.status !== 'signedIn') return replaceHash('#/login/' + (p[1] === 'student' ? 'student' : 'faculty'));
+    // UX guard only. Real protection is Firestore rules + server checks (later stages).
+    if (!NAV[p[1]] || !allowedRoles().includes(p[1])) { app.innerHTML = deniedView(p[1]); return; }
+    setView(p[1], p[2]);
+    app.innerHTML = shell(currentView());
+    return;
+  }
+
+  app.innerHTML = landingView();
+}
+
+/* Re-render and keep scroll position and chat scroll. */
+function refresh() {
+  const y = window.scrollY;
+  render();
+  window.scrollTo(0, y);
+  const m = $('#msgs'); if (m) m.scrollTop = m.scrollHeight;
+}
+
+function go(view) {
+  State.notifOpen = false;
+  const target = `${base()}${State.role}/${view}`;
+  if (location.hash === target) return refresh();
+  location.hash = target;
+}
+
+window.addEventListener('hashchange', () => {
+  const r = parseRoute()[0];
+  State.selected.clear(); State.notifOpen = false; State.authError = null;
+  if (r === 'app' || r === 'demo') {
+    State.loading = true; render();
+    clearTimeout(window.__lt);
+    window.__lt = setTimeout(() => { State.loading = false; refresh(); }, 220);
+  } else { State.loading = false; render(); window.scrollTo(0, 0); }
+});
+
+/* ---------- Firebase auth state ---------- */
+let authSeq = 0, resolveAuthReady;
+const authReady = new Promise(r => { resolveAuthReady = r; });
+
+async function onUser(user, err) {
+  const seq = ++authSeq;
+  if (!user) {
+    State.auth = { status: 'signedOut', user: null, roles: [], warning: null, error: err ? err.message : null };
+    if (err) State.authError = err.message;
+    resolveAuthReady(); render(); return;
+  }
+  State.auth = { status: 'loading', user: null, roles: [], warning: null, error: null };
+  render();
+  // Roles come from Firestore (read-only for users). The profile write is separate.
+  const [rolesRes, profRes] = await Promise.allSettled([B.loadRoles(user.uid), B.syncProfile(user)]);
+  if (seq !== authSeq) return; // a newer sign-in/out superseded this one
+  const warnings = [];
+  let roles = [];
+  if (rolesRes.status === 'fulfilled') roles = rolesRes.value;
+  else warnings.push('Could not load your role information, so you have Student access only. ' + rolesRes.reason.message);
+  if (profRes.status === 'rejected' && !warnings.some(w => w.includes(profRes.reason.message))) warnings.push('Could not save your profile. ' + profRes.reason.message);
+  State.auth = {
+    status: 'signedIn', roles, error: null, warning: warnings.join(' ') || null,
+    user: { uid: user.uid, displayName: user.displayName || '', email: user.email || '', photoURL: user.photoURL || null }
+  };
+  resolveAuthReady(); render();
+}
+
+async function doSignIn() {
+  if (State.busy || !B) return;
+  State.busy = true; State.authError = null; refresh();
+  try { await B.signIn(); }
+  catch (e) { State.authError = e.cancelled ? 'Sign-in was cancelled. Tap the button to try again.' : e.message; }
+  finally { State.busy = false; refresh(); }
+}
+
+async function doSignOut() {
+  if (State.demo) { location.hash = '#/'; return; }
+  try { await B.signOut(); location.hash = '#/'; toast('You have been signed out.', 'info'); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+/* ---------- field helpers ---------- */
+const val = id => ($('#' + id) || { value: '' }).value.trim();
+function setErr(id, msg) {
+  const i = $('#' + id), e = $('#e-' + id);
+  if (i) i.classList.toggle('err', !!msg);
+  if (e) e.textContent = msg || '';
+  return !!msg;
+}
+const field = (id, label, extra = '') => `<div style="margin-bottom:12px"><label class="f" for="${id}">${label}</label>${extra}<div class="errtext" id="e-${id}"></div></div>`;
+const inputHtml = (id, attrs = '') => `<input class="input" id="${id}" ${attrs}>`;
+
+/* ---------- dialogs ---------- */
+function newClassDialog(existing) {
+  const code = existing ? existing.code : String(Math.floor(100000 + Math.random() * 900000));
+  openModal({
+    title: existing ? 'Edit class' : 'New class',
+    body: field('f-name', 'Class name', inputHtml('f-name', `maxlength="60" value="${existing ? esc(existing.name) : ''}" placeholder="e.g. BCA Cybersecurity – Sem 1"`)) +
+      (existing ? '' : field('f-pass', 'Class password (at least 6 characters)', inputHtml('f-pass', 'type="password" autocomplete="new-password" maxlength="40"'))) +
+      `<div class="notice">Join code: <b>${code}</b>. ${existing ? 'The code stays the same.' : 'In the real app, the code and password are created and checked on the server. This password is not stored anywhere in preview mode.'}</div>`,
+    actions: [{ label: 'Cancel' }, {
+      label: existing ? 'Save' : 'Create class', cls: 'btn-primary', onClick() {
+        const name = val('f-name'); let bad = false;
+        bad = setErr('f-name', name.length < 3 ? 'Enter a class name (3+ characters).' : '') || bad;
+        if (!existing) bad = setErr('f-pass', val('f-pass').length < 6 ? 'Password must be at least 6 characters.' : '') || bad;
+        if (bad) return false;
+        if (existing) { existing.name = name; toast('Class updated (demo only).'); }
+        else { State.classes.push({ id: 'c' + Date.now(), name, code, students: 0, att: 0, archived: false }); toast('Class created (demo only).'); }
+        refresh();
+      }
+    }]
+  });
+}
+
+function reviewDialog(kind, id) {
+  const r = State.requests.find(x => x.id === id), approve = kind === 'approve';
+  openModal({
+    title: (approve ? 'Approve' : 'Reject') + ' request',
+    body: `<p class="muted small" style="margin-bottom:12px">${esc(r.title)}</p>` + field('f-resp', 'Response to the student (optional)', `<textarea class="input" id="f-resp" maxlength="300"></textarea>`) +
+      (approve ? '<div class="notice">Approving does not change any attendance record automatically.</div>' : ''),
+    actions: [{ label: 'Cancel' }, {
+      label: approve ? 'Approve' : 'Reject', cls: approve ? 'btn-ok' : 'btn-danger', onClick() {
+        r.status = approve ? 'Approved' : 'Rejected'; r.response = val('f-resp');
+        toast('Request ' + r.status.toLowerCase() + ' (demo only).', approve ? 'ok' : 'info'); refresh();
+      }
+    }]
+  });
+}
+
+function finalizeDialog() {
+  const a = State.att, total = State.roster.length;
+  const p = State.roster.filter(s => a.marks[s.id] === 'P').length, ab = State.roster.filter(s => a.marks[s.id] === 'A').length, un = total - p - ab;
+  openModal({
+    title: 'Finalize attendance?',
+    body: `<div class="counts" style="grid-template-columns:repeat(2,1fr);margin-bottom:12px"><div><b>${total}</b><span class="muted small">Total students</span></div><div><b style="color:var(--ok)">${p}</b><span class="muted small">Present</span></div><div><b style="color:var(--bad)">${ab}</b><span class="muted small">Absent</span></div><div><b style="color:var(--warn)">${un}</b><span class="muted small">Unmarked</span></div></div>` +
+      (un ? `<div class="notice"><b>${un}</b> student${un > 1 ? 's are' : ' is'} still unmarked. If you confirm, ${un > 1 ? 'they' : 'this student'} will automatically be marked <b>Present</b>.</div>` : '<p class="muted small">Everyone is marked. Confirm to save this session.</p>'),
+    actions: [{ label: 'Go back' }, {
+      label: 'Confirm and finalize', cls: 'btn-primary', onClick() {
+        State.roster.forEach(s => { if (!a.marks[s.id]) a.marks[s.id] = 'P'; });
+        const P = State.roster.filter(s => a.marks[s.id] === 'P').length, A = State.roster.length - P;
+        const cls = State.classes.find(c => c.id === a.classId) || State.classes[0];
+        State.history.unshift({ date: isoDate(new Date()), no: a.sessionNo, cls: cls.name, present: P, absent: A });
+        a.lastSummary = { no: a.sessionNo, p: P, a: A };
+        a.sessionNo++; a.marks = {};
+        toast('Session finalized (demo only, not saved).'); refresh();
+      }
+    }]
+  });
+}
+
+function addStudentDialog() {
+  openModal({
+    title: 'Add student', body: field('f-sname', 'Student name', inputHtml('f-sname', 'maxlength="60" autocomplete="off"')),
+    actions: [{ label: 'Cancel' }, {
+      label: 'Add', cls: 'btn-primary', onClick() {
+        const n = val('f-sname').replace(/\s+/g, ' ');
+        if (setErr('f-sname', !n ? 'Name cannot be blank.' : State.roster.some(s => s.name.toLowerCase() === n.toLowerCase()) ? 'This name is already in the roster.' : '')) return false;
+        State.roster.push({ id: 's' + Date.now(), name: n }); toast('Student added as roll ' + State.roster.length + '.'); refresh();
+      }
+    }]
+  });
+}
+
+function deleteDialog() {
+  const n = State.selected.size;
+  openModal({
+    title: `Delete ${n} student${n > 1 ? 's' : ''}?`,
+    body: `<p class="muted">Roll numbers will be renumbered without gaps. In the real app, past attendance records keep the original names and roll numbers.</p>`,
+    actions: [{ label: 'Cancel' }, {
+      label: 'Delete', cls: 'btn-danger', onClick() {
+        State.roster = State.roster.filter(s => !State.selected.has(s.id));
+        State.selected.clear(); toast(`Deleted ${n} student${n > 1 ? 's' : ''}. Rolls renumbered.`); refresh();
+      }
+    }]
+  });
+}
+
+function joinClassDialog() {
+  openModal({
+    title: 'Join a class',
+    body: field('f-code', 'Six-digit join code', inputHtml('f-code', 'inputmode="numeric" maxlength="6" autocomplete="off" placeholder="123456"')) +
+      field('f-jpass', 'Class password', inputHtml('f-jpass', 'type="password" autocomplete="off" maxlength="40"')) +
+      '<div class="notice">Demo only: no code or password is checked yet. Real checking happens on the server in Stage 3.</div>',
+    actions: [{ label: 'Cancel' }, {
+      label: 'Send request', cls: 'btn-primary', onClick() {
+        let bad = setErr('f-code', /^\d{6}$/.test(val('f-code')) ? '' : 'Enter exactly 6 digits.');
+        bad = setErr('f-jpass', val('f-jpass') ? '' : 'Enter the class password.') || bad;
+        if (bad) return false;
+        State.myJoin.unshift({ cls: 'Class ' + val('f-code'), status: 'Pending', when: isoDate(new Date()) });
+        toast('Join request sent (demo only).'); refresh();
+      }
+    }]
+  });
+}
+
+function newRequestDialog() {
+  openModal({
+    title: 'New request',
+    body: field('f-rt', 'Title', inputHtml('f-rt', 'maxlength="80"')) +
+      field('f-rc', 'Related class', `<select class="input" id="f-rc">${State.classes.map(c => `<option>${esc(c.name)}</option>`).join('')}</select>`) +
+      field('f-rb', 'Description (at least 20 characters)', `<textarea class="input" id="f-rb" maxlength="1000"></textarea>`),
+    actions: [{ label: 'Cancel' }, {
+      label: 'Submit', cls: 'btn-primary', onClick() {
+        let bad = setErr('f-rt', val('f-rt').length < 4 ? 'Add a short title.' : '');
+        bad = setErr('f-rb', val('f-rb').length < 20 ? 'Please write at least 20 characters.' : '') || bad;
+        if (bad) return false;
+        State.requests.unshift({ id: 'r' + Date.now(), title: val('f-rt'), body: val('f-rb'), cls: val('f-rc'), status: 'Pending', when: isoDate(new Date()), response: '' });
+        toast('Request submitted (demo only).'); refresh();
+      }
+    }]
+  });
+}
+
+function announceDialog() {
+  openModal({
+    title: 'New announcement',
+    body: field('f-at', 'Title', inputHtml('f-at', 'maxlength="80"')) + field('f-ab', 'Message', `<textarea class="input" id="f-ab" maxlength="500"></textarea>`),
+    actions: [{ label: 'Cancel' }, {
+      label: 'Post', cls: 'btn-primary', onClick() {
+        let bad = setErr('f-at', val('f-at').length < 3 ? 'Add a title.' : '');
+        bad = setErr('f-ab', val('f-ab').length < 5 ? 'Write a message.' : '') || bad;
+        if (bad) return false;
+        State.announcements.unshift({ title: val('f-at'), body: val('f-ab'), when: isoDate(new Date()) }); toast('Announcement posted (demo only).'); refresh();
+      }
+    }]
+  });
+}
+
+function importDialog() {
+  openModal({
+    title: 'Import students',
+    body: `<div class="notice">Spreadsheet import (CSV and Excel, with preview, column choice and duplicate checks) is built in Stage 4. It is not available yet.</div>`,
+    actions: [{ label: 'Got it', cls: 'btn-primary' }]
+  });
+}
+
+/* ---------- click actions ---------- */
+/* Features that are not built yet. In real mode they say so instead of pretending to save. */
+const STAGE_FOR = {
+  'join-approve': 3, 'join-reject': 3, 'new-class': 3, 'edit-class': 3, 'archive-class': 3, 'restore-class': 3, 'join-class': 3,
+  'add-student': 4, import: 4, 'delete-selected': 4,
+  mark: 5, 'mark-all': 5, finalize: 5, pdf: 6,
+  'req-approve': 7, 'req-reject': 7, 'new-request': 7,
+  'new-announcement': 8, room: 8
+};
+const notYet = n => toast(`Not available yet. This feature arrives in Stage ${n}.`, 'info');
+
+const Actions = {
+  'google-signin': doSignIn,
+  nav: el => go(el.dataset.view),
+  logout: doSignOut,
+  'toggle-notif': () => { State.notifOpen = !State.notifOpen; refresh(); },
+  'modal-backdrop': (el, e) => { if (e.target === el) closeModal(); },
+  'join-approve': el => { State.joinRequests.find(j => j.id === el.dataset.id).status = 'Approved'; toast('Join request approved (demo only).'); refresh(); },
+  'join-reject': el => { State.joinRequests.find(j => j.id === el.dataset.id).status = 'Rejected'; toast('Join request rejected (demo only).', 'info'); refresh(); },
+  'new-announcement': announceDialog,
+  'new-class': () => newClassDialog(),
+  'edit-class': el => newClassDialog(State.classes.find(c => c.id === el.dataset.id)),
+  'archive-class': el => { State.classes.find(c => c.id === el.dataset.id).archived = true; toast('Class archived (demo only).', 'info'); refresh(); },
+  'restore-class': el => { State.classes.find(c => c.id === el.dataset.id).archived = false; toast('Class restored.'); refresh(); },
+  'join-class': joinClassDialog,
+  mark: el => { const m = State.att.marks; m[el.dataset.id] = m[el.dataset.id] === el.dataset.v ? undefined : el.dataset.v; refresh(); },
+  'mark-all': () => { State.roster.forEach(s => State.att.marks[s.id] = 'P'); refresh(); },
+  finalize: finalizeDialog,
+  pdf: () => toast('PDF reports are built in Stage 6. Not available yet.', 'info'),
+  'add-student': addStudentDialog,
+  import: importDialog,
+  'delete-selected': () => State.selected.size && deleteDialog(),
+  'req-approve': el => reviewDialog('approve', el.dataset.id),
+  'req-reject': el => reviewDialog('reject', el.dataset.id),
+  'new-request': newRequestDialog,
+  room: el => { State.room = el.dataset.id; refresh(); }
+};
+
+document.addEventListener('click', e => {
+  const t = e.target.closest('[data-action]');
+  if (t && Actions[t.dataset.action]) {
+    const stage = STAGE_FOR[t.dataset.action];
+    if (!State.demo && stage) return notYet(stage);
+    Actions[t.dataset.action](t, e);
+  } else if (State.notifOpen && !e.target.closest('.notif-panel')) { State.notifOpen = false; refresh(); }
+});
+
+const Changes = {
+  'att-class': el => { State.att.classId = el.value; State.att.marks = {}; refresh(); },
+  'roster-all': el => { State.selected = el.checked ? new Set(State.roster.map(s => s.id)) : new Set(); refresh(); },
+  'roster-check': el => { el.checked ? State.selected.add(el.dataset.id) : State.selected.delete(el.dataset.id); refresh(); }
+};
+document.addEventListener('change', e => {
+  const t = e.target.closest('[data-change]');
+  if (t && Changes[t.dataset.change] && State.demo) Changes[t.dataset.change](t);
+});
+
+document.addEventListener('submit', e => {
+  const f = e.target.closest('[data-form="chat"]'); if (!f) return;
+  e.preventDefault();
+  if (!State.demo) return notYet(8);
+  const text = f.msg.value.trim();
+  if (!text) return toast('Type a message first.', 'err');
+  if (text.length > 500) return toast('Messages can be up to 500 characters.', 'err');
+  const now = new Date();
+  State.messages.push({ who: me().name, me: true, text, time: pad2(now.getHours()) + ':' + pad2(now.getMinutes()) });
+  refresh(); const i = $('input[name=msg]'); if (i) i.focus();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+/* ---------- start ---------- */
+(async function start() {
+  render();
+  const res = B ? await B.init() : { ok: false, reason: 'load-failed', message: 'The Firebase script did not load. Reload the page.' };
+  if (!res.ok) {
+    State.auth = { status: res.reason === 'unconfigured' ? 'unconfigured' : 'failed', user: null, roles: [], warning: null, error: res.message };
+    resolveAuthReady(); render();
+  } else {
+    if (res.redirectError) State.authError = res.redirectError;
+    B.onAuth(onUser);
+  }
+  // Keep the splash for at least 1.6s, and until sign-in state is known (8s safety cap).
+  await Promise.all([new Promise(r => setTimeout(r, 1600)), Promise.race([authReady, new Promise(r => setTimeout(r, 8000))])]);
+  $('#splash').classList.add('hide');
+})();
