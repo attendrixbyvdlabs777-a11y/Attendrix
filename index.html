@@ -19,3 +19,43 @@ window.addEventListener('error', function (e) {
   else window.__startupErrors.push(String(e.message || 'Script error'));
 }, true);
 if (typeof structuredClone !== 'function') {
+  window.structuredClone = function (o) { return JSON.parse(JSON.stringify(o)); };
+}
+</script>
+</head>
+<body>
+<div id="splash" aria-hidden="true">
+  <div class="splash-logo"><span class="logo-mark big">✓</span></div>
+  <h1 class="splash-title">Attendrix</h1>
+  <div class="splash-bar"><span></span></div>
+  <p class="splash-powered">Powered by VD Labs</p>
+</div>
+<div id="app"></div>
+<div id="toasts" aria-live="polite"></div>
+<div id="modal-root"></div>
+<noscript><p style="padding:24px;color:#fff">Attendrix needs JavaScript enabled.</p></noscript>
+<!-- Load order matters: config -> firebase -> data -> ui -> views -> app -->
+<script src="firebase-config.js"></script>
+<script src="firebase.js"></script>
+<script src="data.js"></script>
+<script src="ui.js"></script>
+<script src="views.js"></script>
+<script src="app.js"></script>
+<script>
+/* Last-resort safety net, independent of app.js. After 9 seconds the splash is always removed.
+   If the app drew nothing, say what is wrong instead of showing a blank page. */
+setTimeout(function () {
+  var s = document.getElementById('splash');
+  if (s) { s.classList.add('hide'); s.style.display = 'none'; }
+  var app = document.getElementById('app');
+  if (app && !app.children.length) {
+    var p = document.createElement('p');
+    p.style.cssText = 'padding:24px;color:#e8eefc;font-family:sans-serif;line-height:1.5;word-break:break-word';
+    p.textContent = 'Attendrix could not start. Make sure these files are uploaded next to index.html: styles.css, firebase-config.js, firebase.js, data.js, ui.js, views.js, app.js. Then reload the page.' +
+      (window.__startupErrors.length ? ' Problem found: ' + window.__startupErrors.slice(0, 3).join('; ') : '');
+    app.appendChild(p);
+  }
+}, 9000);
+</script>
+</body>
+</html>
