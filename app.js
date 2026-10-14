@@ -6,8 +6,52 @@ const parseRoute = () => (location.hash || '#/').replace(/^#\/?/, '').split('/')
 const replaceHash = h => location.replace(h);
 function setView(role, view) { State.role = role; State.view = NAV[role].some(n => n[0] === view) ? view : 'dashboard'; }
 
-/* One function decides what is on screen, from the URL and the sign-in state. */
+/* ---------- startup safety ---------- */
+let splashHidden = false;
+function hideSplash() {
+  if (splashHidden) return;
+  splashHidden = true;
+  const sp = document.getElementById('splash');
+  if (sp) { sp.classList.add('hide'); setTimeout(() => { sp.style.display = 'none'; }, 700); }
+}
+const plainEsc = x => String(x).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/* Self-contained error screen. Uses no other app code, so it still works if views.js failed. */
+function showFatal(title, err) {
+  hideSplash();
+  const detail = err ? String(err && err.message ? err.message : err) : '';
+  const extra = (window.__startupErrors || []).slice(0, 3).map(plainEsc).join('<br>');
+  app.innerHTML = '<div class="auth-wrap"><div class="auth-card" style="text-align:center">' +
+    '<h2>' + plainEsc(title) + '</h2>' +
+    '<p class="muted small">Reload the page. If this keeps happening, check that every file is uploaded next to index.html.</p>' +
+    (detail || extra ? '<div class="notice bad" role="alert" style="text-align:left;margin-top:12px;word-break:break-word"><b class="small">Technical detail:</b> ' + plainEsc(detail) + (extra ? '<br>' + extra : '') + '</div>' : '') +
+    '<div class="stack" style="margin-top:18px"><button class="btn btn-primary btn-block" onclick="location.reload()">Reload page</button></div>' +
+    '</div></div>';
+}
+
+/* Resolves with `fallback` if `promise` has not settled after `ms`. Never rejects. */
+function withTimeout(promise, ms, fallback) {
+  return new Promise(resolve => {
+    const t = setTimeout(() => resolve(fallback), ms);
+    Promise.resolve(promise).then(v => { clearTimeout(t); resolve(v); }, () => { clearTimeout(t); resolve(fallback); });
+  });
+}
+
+/* Honest status line on the public pages when Firebase did not start. */
+function initBanner() {
+  const a = State.auth;
+  if (a.status !== 'failed' && a.status !== 'unconfigured') return '';
+  return '<div class="container" style="padding-top:12px"><div class="notice bad" role="alert"><b>Firebase is not connected.</b> ' + plainEsc(a.error || 'Sign-in is unavailable.') + '</div></div>';
+}
+
+/* Any draw error shows a readable message instead of a blank or stuck page. */
 function render() {
+  try { renderRoute(); }
+  catch (e) { console.error('Render failed', e); showFatal('Attendrix could not draw this page.', e); }
+}
+
+/* One function decides what is on screen, from the URL and the sign-in state. */
+function renderRoute() {
   const p = parseRoute(), a = State.auth;
 
   // Demo: sample data, no sign-in, clearly labelled.
@@ -40,7 +84,7 @@ function render() {
     return;
   }
 
-  app.innerHTML = landingView();
+  app.innerHTML = initBanner() + landingView();
 }
 
 /* Re-render and keep scroll position and chat scroll. */
@@ -336,17 +380,40 @@ document.addEventListener('submit', e => {
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
 /* ---------- start ---------- */
+/* Rules: (1) the splash never stays longer than 7 seconds, whatever Firebase does;
+   (2) every step is guarded so an exception becomes a readable message;
+   (3) Firebase is only reported as working after it has really started. */
+window.addEventListener('error', e => { if (!app.children.length) showFatal('Attendrix hit an error while starting.', e.error || e.message); });
+window.addEventListener('unhandledrejection', e => { if (!app.children.length) showFatal('Attendrix hit an error while starting.', e.reason); });
+
 (async function start() {
-  render();
-  const res = B ? await B.init() : { ok: false, reason: 'load-failed', message: 'The Firebase script did not load. Reload the page.' };
-  if (!res.ok) {
-    State.auth = { status: res.reason === 'unconfigured' ? 'unconfigured' : 'failed', user: null, roles: [], warning: null, error: res.message };
-    resolveAuthReady(); render();
-  } else {
-    if (res.redirectError) State.authError = res.redirectError;
-    B.onAuth(onUser);
+  setTimeout(hideSplash, 7000);
+  try {
+    render(); // draw straight away; render() is guarded, so a drawing error cannot stall startup
+    let res;
+    if (!B) res = { ok: false, reason: 'load-failed', message: 'The Firebase script (firebase.js) did not load. Check that it is uploaded next to index.html, then reload.' };
+    else res = await withTimeout(B.init(), 15000, { ok: false, reason: 'timeout', message: 'Firebase took too long to load. Check your internet connection and reload the page.' });
+
+    if (!res.ok) {
+      State.auth = { status: res.reason === 'unconfigured' ? 'unconfigured' : 'failed', user: null, roles: [], warning: null, error: res.message };
+      resolveAuthReady(); render();
+    } else {
+      if (res.redirectError) State.authError = res.redirectError;
+      B.onAuth(onUser);
+      // If Firebase never reports a sign-in state, stop waiting and say so.
+      setTimeout(() => {
+        if (authSeq === 0) {
+          State.auth = { status: 'failed', user: null, roles: [], warning: null, error: 'Firebase did not report your sign-in state in time. Check your internet connection and reload the page.' };
+          resolveAuthReady(); render();
+        }
+      }, 12000);
+    }
+  } catch (e) {
+    console.error('Startup failed', e);
+    State.auth = { status: 'failed', user: null, roles: [], warning: null, error: 'Startup error: ' + (e && e.message ? e.message : e) };
+    resolveAuthReady();
+    showFatal('Attendrix hit an error while starting.', e);
   }
-  // Keep the splash for at least 1.6s, and until sign-in state is known (8s safety cap).
-  await Promise.all([new Promise(r => setTimeout(r, 1600)), Promise.race([authReady, new Promise(r => setTimeout(r, 8000))])]);
-  $('#splash').classList.add('hide');
+  // Normal path: keep the splash for at least 1.6s, then hide once the sign-in state is known.
+  Promise.all([new Promise(r => setTimeout(r, 1600)), authReady]).then(hideSplash);
 })();
