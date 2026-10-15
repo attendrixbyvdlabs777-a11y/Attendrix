@@ -137,6 +137,19 @@ function loginView(kind) {
   </div></div>`;
 }
 
+/* Shows the signed-in user's UID (what roles/{uid} must be named) and what the lookup found. */
+function uidBlock() {
+  const a = State.auth, u = a.user, d = a.diag;
+  if (!u) return '';
+  let line = '';
+  if (d && !d.exists) line = `No document exists at <b>roles/${esc(u.uid)}</b>. Create a document in the <b>roles</b> collection with exactly this ID.`;
+  else if (d && d.exists) line = `A roles document exists, but its <b>roles</b> field is <b>${esc(d.type)}</b>${d.type !== 'missing' ? ' (' + esc(d.valueText) + ')' : ''}. It must be an <b>array</b> containing <b>faculty</b> or <b>cr</b>.`;
+  return `<div class="notice info" style="text-align:left;margin-top:12px"><div class="small muted">Your account ID (UID)</div>
+    <code style="display:block;word-break:break-all;user-select:all;margin:6px 0">${esc(u.uid)}</code>
+    <button class="btn btn-ghost btn-sm" data-action="copy-uid" data-uid="${esc(u.uid)}">Copy UID</button>
+    ${line ? `<p class="small" style="margin-top:10px">${line}</p>` : ''}</div>`;
+}
+
 function deniedView(role) {
   const a = State.auth, who = esc((a.user && a.user.email) || '');
   const staff = role === 'faculty' || role === 'cr' || !role;
@@ -145,6 +158,7 @@ function deniedView(role) {
     <h2>${staff ? 'No ' + (role === 'cr' ? 'Class Representative' : 'faculty') + ' access' : 'Access denied'}</h2>
     <p class="muted small">You are signed in as <b>${who}</b>, but this account has not been given that role. Roles are assigned by an administrator and cannot be chosen from the browser.</p>
     ${a.warning ? `<div class="notice bad" style="margin-top:12px;text-align:left">${esc(a.warning)}</div>` : ''}
+    ${uidBlock()}
     <div class="stack" style="margin-top:20px">
       <a class="btn btn-primary btn-block" href="#/app/student/dashboard">Continue as Student</a>
       <button class="btn btn-ghost btn-block" data-action="logout">Sign out</button>
@@ -298,7 +312,7 @@ V.settings = () => {
   <div class="card"><button class="btn btn-danger" data-action="logout">${icon('logout')} Exit demo</button></div>`;
   const roles = allowedRoles();
   return `${banner()}<div class="card"><h3>Profile</h3><div class="row">${avatar(m, 60)}
-    <div><b>${esc(m.name)}</b><div class="muted small">${esc(m.email)}</div>${roles.map(r => `<span class="chip blue" style="margin-right:6px">${ROLE_LABEL[r]}</span>`).join('')}</div></div></div>
+    <div><b>${esc(m.name)}</b><div class="muted small">${esc(m.email)}</div>${roles.map(r => `<span class="chip blue" style="margin-right:6px">${ROLE_LABEL[r]}</span>`).join('')}</div></div>${uidBlock()}</div>
   <div class="card"><h3>Access</h3><p class="muted small" style="margin-bottom:12px">Staff roles are assigned by an administrator. Everyone who signs in can use the Student dashboard.</p>
     <div class="row wrap">${roles.map(r => `<a class="btn ${r === State.role ? 'btn-primary' : 'btn-ghost'} btn-sm" href="#/app/${r}/dashboard">${ROLE_LABEL[r]} dashboard</a>`).join('')}</div></div>
   <div class="card"><h3>Account</h3><p class="muted small" style="margin-bottom:12px">Signed in with Google. Your session is remembered on this device until you sign out.</p>
