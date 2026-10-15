@@ -133,8 +133,14 @@ async function onUser(user, err) {
   if (rolesRes.status === 'fulfilled') roles = rolesRes.value;
   else warnings.push('Could not load your role information, so you have Student access only. ' + rolesRes.reason.message);
   if (profRes.status === 'rejected' && !warnings.some(w => w.includes(profRes.reason.message))) warnings.push('Could not save your profile. ' + profRes.reason.message);
+  // No staff role found: look at the roles document so the screen can say why.
+  let diag = null;
+  if (rolesRes.status === 'fulfilled' && roles.length === 0) {
+    diag = await withTimeout(B.inspectRoles(user.uid), 6000, null);
+    if (seq !== authSeq) return;
+  }
   State.auth = {
-    status: 'signedIn', roles, error: null, warning: warnings.join(' ') || null,
+    status: 'signedIn', roles, diag, error: null, warning: warnings.join(' ') || null,
     user: { uid: user.uid, displayName: user.displayName || '', email: user.email || '', photoURL: user.photoURL || null }
   };
   resolveAuthReady(); render();
@@ -323,6 +329,10 @@ const notYet = n => toast(`Not available yet. This feature arrives in Stage ${n}
 const Actions = {
   'google-signin': doSignIn,
   nav: el => go(el.dataset.view),
+  'copy-uid': async el => {
+    try { await navigator.clipboard.writeText(el.dataset.uid); toast('UID copied.'); }
+    catch (e) { toast('Could not copy. Press and hold the UID text to select it.', 'err'); }
+  },
   logout: doSignOut,
   'toggle-notif': () => { State.notifOpen = !State.notifOpen; refresh(); },
   'modal-backdrop': (el, e) => { if (e.target === el) closeModal(); },
