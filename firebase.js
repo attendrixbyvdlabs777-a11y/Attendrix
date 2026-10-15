@@ -141,9 +141,31 @@
       const snap = await fsM.getDoc(fsM.doc(db, 'roles', uid));
       if (!snap.exists()) return [];
       const r = snap.data().roles;
-      return Array.isArray(r) ? r.filter(x => ALLOWED_STAFF_ROLES.includes(x)) : [];
+      // Tolerates common console slips: a single text value, capital letters, stray spaces.
+      // Safe because only an administrator can write this document.
+      const list = Array.isArray(r) ? r : (typeof r === 'string' ? r.split(',') : []);
+      const clean = list.map(x => String(x).trim().toLowerCase());
+      return [...new Set(clean)].filter(x => ALLOWED_STAFF_ROLES.includes(x));
     } catch (e) { throw wrap(e); }
   }
 
-  window.AttendrixBackend = { init, onAuth, signIn, signOut, syncProfile, loadRoles, isConfigured };
+  /* Describes what roles/{uid} contains, so the screen can explain why access was not granted.
+     Only ever reads the signed-in user's own document. */
+  async function inspectRoles(uid) {
+    const { db, fsM } = fb;
+    try {
+      const snap = await fsM.getDoc(fsM.doc(db, 'roles', uid));
+      if (!snap.exists()) return { exists: false };
+      const v = snap.data().roles;
+      let text = '';
+      try { text = JSON.stringify(v); } catch (e) { text = ''; }
+      return {
+        exists: true,
+        type: v === undefined ? 'missing' : Array.isArray(v) ? 'array' : typeof v,
+        valueText: String(text === undefined ? '' : text).slice(0, 80)
+      };
+    } catch (e) { throw wrap(e); }
+  }
+
+  window.AttendrixBackend = { init, onAuth, signIn, signOut, syncProfile, loadRoles, inspectRoles, isConfigured };
 })();
