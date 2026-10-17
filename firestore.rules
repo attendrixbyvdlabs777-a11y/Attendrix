@@ -1,6 +1,6 @@
 rules_version = '2';
 
-// ATTENDRIX – Firestore security rules (Phase 3, step 3a: classes)
+// ATTENDRIX – Firestore security rules (Phase 3, steps 3a-3b: classes, join requests, members)
 // Default is DENY. Only the rules below grant access; everything else stays closed.
 // Later steps add explicit rules for join requests, rosters, attendance, chat, etc.
 //
@@ -54,6 +54,19 @@ service cloud.firestore {
         && d.iter is int && d.iter >= 100000 && d.iter <= 1000000;
     }
 
+    function secretPath(id) {
+      return /databases/$(database)/documents/classSecrets/$(id);
+    }
+    function codePath(code) {
+      return /databases/$(database)/documents/classCodes/$(code);
+    }
+    function reqPath(id) {
+      return /databases/$(database)/documents/joinRequests/$(id);
+    }
+    function memberPath(classId, uid) {
+      return /databases/$(database)/documents/classes/$(classId)/members/$(uid);
+    }
+
     // Each user can read and maintain only their own profile.
     match /users/{uid} {
       allow read: if isOwner(uid);
@@ -103,25 +116,30 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // Public lookup used by a student who types a class code. It holds NO secret: only the class id
-    // and the random salt the student's browser needs to hash the password. One document can be
-    // fetched by its exact code; listing or searching is not allowed.
+    // Public lookup used by a student who types a class code. It holds NO secret: the class id, its
+    // owner, its name (so a student can see which class they asked to join) and the random salt the
+    // student's browser needs to hash the password. One document can be fetched by its exact code;
+    // listing or searching is not allowed.
     match /classCodes/{code} {
       allow get: if signedIn();
       allow list: if false;
       allow create: if isFaculty()
         && validCodeKey(code)
-        && request.resource.data.keys().hasOnly(['classId', 'salt', 'iter'])
-        && request.resource.data.keys().hasAll(['classId', 'salt', 'iter'])
+        && request.resource.data.keys().hasOnly(['classId', 'ownerUid', 'className', 'salt', 'iter'])
+        && request.resource.data.keys().hasAll(['classId', 'ownerUid', 'className', 'salt', 'iter'])
         && request.resource.data.classId is string
         && validSalt(request.resource.data)
+        && request.resource.data.ownerUid == request.auth.uid
         && getAfter(classPath(request.resource.data.classId)).data.ownerUid == request.auth.uid
-        && getAfter(classPath(request.resource.data.classId)).data.codeKey == code;
-      // Used when the owner resets the enrollment password (a new salt).
+        && getAfter(classPath(request.resource.data.classId)).data.codeKey == code
+        && request.resource.data.className == getAfter(classPath(request.resource.data.classId)).data.name;
+      // Owner only: a new salt (password reset), or keeping className/ownerUid in step with the class.
       allow update: if isFaculty()
         && get(classPath(resource.data.classId)).data.ownerUid == request.auth.uid
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['salt', 'iter'])
-        && validSalt(request.resource.data);
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['salt', 'iter', 'className', 'ownerUid'])
+        && validSalt(request.resource.data)
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.className == getAfter(classPath(resource.data.classId)).data.name;
       allow delete: if false;
     }
 
@@ -140,6 +158,80 @@ service cloud.firestore {
         && request.resource.data.verifier.matches('^[0-9a-f]{64}$')
         && get(classPath(classId)).data.ownerUid == request.auth.uid;
       allow delete: if false;
+    }
+
+    // ---- Join requests -------------------------------------------------------
+    // One document per (class, student): the id is "<classId>_<studentUid>", so a duplicate request
+    // is impossible. A student can only CREATE a pending request, and only with the correct enrollment
+    // password: "proof" (a hash computed in the browser) must equal the hash stored in classSecrets,
+    // which no browser can read. The student cannot set the status, the owner or the class name to
+    // anything the rules do not confirm. Only the class owner can approve or reject.
+    match /joinRequests/{reqId} {
+      allow get: if signedIn()
+        && (reqId.split('_')[1] == request.auth.uid
+            || (isFaculty() && resource.data.ownerUid == request.auth.uid));
+      allow list: if signedIn()
+        && (resource.data.studentUid == request.auth.uid
+            || (isFaculty() && resource.data.ownerUid == request.auth.uid));
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['classId', 'ownerUid', 'studentUid', 'className', 'displayName',
+             'email', 'photoURL', 'status', 'proof', 'createdAt'])
+        && request.resource.data.keys().hasAll(['classId', 'ownerUid', 'studentUid', 'className', 'displayName',
+             'email', 'photoURL', 'status', 'proof', 'createdAt'])
+        && request.resource.data.classId is string
+        && reqId == request.resource.data.classId + '_' + request.auth.uid
+        && request.resource.data.studentUid == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.email is string && request.resource.data.email == request.auth.token.email
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 1 && request.resource.data.displayName.size() <= 120
+        && (request.resource.data.photoURL == null
+            || (request.resource.data.photoURL is string && request.resource.data.photoURL.size() <= 500))
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.proof is string
+        && request.resource.data.proof.matches('^[0-9a-f]{64}$')
+        && request.resource.data.proof == get(secretPath(request.resource.data.classId)).data.verifier
+        && get(classPath(request.resource.data.classId)).data.status == 'active'
+        && request.resource.data.ownerUid == get(classPath(request.resource.data.classId)).data.ownerUid
+        && request.resource.data.className ==
+             get(codePath(get(classPath(request.resource.data.classId)).data.codeKey)).data.className
+        && !exists(memberPath(request.resource.data.classId, request.auth.uid));
+      // The class owner decides a pending request. Approving must come with the member document.
+      allow update: if isFaculty()
+        && resource.data.ownerUid == request.auth.uid
+        && resource.data.status == 'pending'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'decidedAt', 'decidedBy'])
+        && request.resource.data.status in ['approved', 'rejected']
+        && request.resource.data.decidedAt == request.time
+        && request.resource.data.decidedBy == request.auth.uid
+        && (request.resource.data.status == 'rejected'
+            || existsAfter(memberPath(resource.data.classId, resource.data.studentUid)));
+      // A student may withdraw their own pending or rejected request. Approved requests stay.
+      allow delete: if signedIn()
+        && resource.data.studentUid == request.auth.uid
+        && resource.data.status in ['pending', 'rejected'];
+    }
+
+    // ---- Class members (approved students) ------------------------------------
+    // Created only by the class owner, in the same batch that approves the request, and only from
+    // the details the student submitted. Nobody can edit one; removal arrives with the roster step.
+    match /classes/{classId}/members/{uid} {
+      allow get: if signedIn()
+        && (request.auth.uid == uid
+            || (isFaculty() && get(classPath(classId)).data.ownerUid == request.auth.uid));
+      allow list: if isFaculty() && get(classPath(classId)).data.ownerUid == request.auth.uid;
+      allow create: if isFaculty()
+        && get(classPath(classId)).data.ownerUid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['studentUid', 'displayName', 'email', 'photoURL', 'joinedAt'])
+        && request.resource.data.keys().hasAll(['studentUid', 'displayName', 'email', 'photoURL', 'joinedAt'])
+        && request.resource.data.studentUid == uid
+        && request.resource.data.joinedAt == request.time
+        && get(reqPath(classId + '_' + uid)).data.status == 'pending'
+        && getAfter(reqPath(classId + '_' + uid)).data.status == 'approved'
+        && request.resource.data.displayName == get(reqPath(classId + '_' + uid)).data.displayName
+        && request.resource.data.email == get(reqPath(classId + '_' + uid)).data.email
+        && request.resource.data.photoURL == get(reqPath(classId + '_' + uid)).data.photoURL;
+      allow update, delete: if false;
     }
 
     // Everything else: denied.
