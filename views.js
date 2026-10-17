@@ -12,7 +12,9 @@ const State = {
   busy: false, authError: null,
   classes: [], roster: [], selected: new Set(), joinRequests: [], requests: [], myJoin: [],
   announcements: [], messages: [], room: null, history: [],
-  att: { classId: null, marks: {}, sessionNo: 1, lastSummary: null }
+  att: { classId: null, marks: {}, sessionNo: 1, lastSummary: null },
+  // Phase 3: real classes for the signed-in faculty. status: 'idle' | 'loading' | 'ready' | 'error'
+  cls: { status: 'idle', error: null }, classOpen: null
 };
 
 /* Where on-screen data comes from: sample data in demo mode, nothing in real mode. */
@@ -23,6 +25,7 @@ function loadData(demo) {
   State.selected = new Set(); State.history = [];
   State.room = demo ? 'm1' : null;
   State.att = { classId: demo ? 'c1' : null, marks: {}, sessionNo: 1, lastSummary: null };
+  State.cls = { status: 'idle', error: null }; State.classOpen = null;
 }
 loadData(false);
 
@@ -53,10 +56,10 @@ const logo = () => `<div class="logo"><span class="logo-mark">✓</span><span>At
 const stat = (ic, val, label) => `<div class="card stat"><div class="sicon">${icon(ic)}</div><div><b>${val}</b><span>${label}</span></div></div>`;
 
 /* Top-of-page status line. Honest about what is real. */
-function banner(stage) {
+function banner(stage, msg) {
   if (State.demo) return `<div class="notice">Demo mode: this screen shows sample data. You are not signed in and nothing is saved.</div>`;
   const warn = State.auth.warning ? `<div class="notice bad">${esc(State.auth.warning)}</div>` : '';
-  const info = stage ? `<div class="notice info">You are signed in. This section is not built yet, so it shows no data. It arrives in Stage ${stage}.</div>` : '';
+  const info = msg ? `<div class="notice info">${esc(msg)}</div>` : stage ? `<div class="notice info">You are signed in. This section is not built yet, so it shows no data. It arrives in Stage ${stage}.</div>` : '';
   return warn + info;
 }
 
@@ -219,11 +222,11 @@ V.dashboard = () => {
     <div class="card"><h3>Announcements</h3>${announcementList()}</div>`;
   }
   const fac = role === 'faculty';
-  return `${banner(3)}
+  return `${fac ? banner(0, 'Classes are live. Attendance, requests and chat are not built yet, so those parts show no data.') : banner(3)}
   <div class="grid g4 stats-row">${stat('book', State.classes.filter(c => !c.archived).length, 'Classes')}${stat('users', State.roster.length, State.demo ? 'Students (sample class)' : 'Students')}${stat('check', allSessions().filter(s => s.date === isoDate(new Date())).length, "Today's sessions")}${stat('inbox', State.joinRequests.filter(j => j.status === 'Pending').length + State.requests.filter(r => r.status === 'Pending').length, 'Pending items')}</div>
   <div class="grid g2">
     <div class="card"><h3>Weekly attendance</h3>${weeklyChart()}</div>
-    <div class="card"><h3>Classes</h3><div class="list">${State.classes.filter(c => !c.archived).map(c => `<div class="item"><div class="grow"><b class="small">${esc(c.name)}</b><div class="bar ${c.att < 80 ? 'low' : ''}" style="margin-top:8px"><i style="width:${c.att}%"></i></div></div><b>${c.att}%</b></div>`).join('') || emptyState('book', 'No classes yet', fac ? 'Create your first class in the Classes tab.' : 'Classes you are assigned to will appear here.')}</div></div>
+    <div class="card"><h3>Classes</h3><div class="list">${State.classes.filter(c => !c.archived).map(dashClassItem).join('') || emptyState('book', 'No classes yet', fac ? 'Create your first class in the Classes tab.' : 'Classes you are assigned to will appear here.')}</div></div>
   </div>
   <div class="card"><h3>Recent sessions</h3>${sessionsTable(allSessions().slice(0, 6))}</div>
   ${fac ? `<div class="grid g2"><div class="card"><h3>Join requests</h3>${joinRequestList(true)}</div>
@@ -231,7 +234,62 @@ V.dashboard = () => {
   : `<div class="card"><h3>Announcements</h3>${announcementList()}</div>`}`;
 };
 
+/* ---------------- Phase 3: real classes (faculty) ---------------- */
+const codeFmt = c => (c ? c.slice(0, 4) + ' ' + c.slice(4) : '');
+const classMeta = c => [c.course, c.department, c.academicYear].filter(Boolean).join(' · ');
+const classTag = c => `Sem ${c.semester} · Sec ${c.section}`;
+
+/* One row in the dashboard "Classes" card. Sample data keeps its attendance bar; real classes link to their page. */
+function dashClassItem(c) {
+  if (State.demo) return `<div class="item"><div class="grow"><b class="small">${esc(c.name)}</b><div class="bar ${c.att < 80 ? 'low' : ''}" style="margin-top:8px"><i style="width:${c.att}%"></i></div></div><b>${c.att}%</b></div>`;
+  return `<div class="item"><div class="grow"><b class="small">${esc(c.name)}</b><div class="muted small">${esc(classTag(c))}</div></div><a class="btn btn-ghost btn-sm" href="#/app/faculty/classes/${esc(c.id)}">Open</a></div>`;
+}
+
+function classCard(c) {
+  return `<div class="card"><div class="row between"><b>${esc(c.name)}</b><span class="chip blue">${esc(classTag(c))}</span></div>
+    <div class="muted small" style="margin-top:6px">${esc(classMeta(c))}${c.subject ? ' · ' + esc(c.subject) : ''}</div>
+    <div class="muted small" style="margin:12px 0 4px">Join code</div><div style="font-size:1.4rem;letter-spacing:.15em;font-weight:700" class="grad">${esc(codeFmt(c.codeKey))}</div>
+    <div class="row wrap" style="margin-top:14px"><button class="btn btn-primary btn-sm" data-action="open-class" data-id="${esc(c.id)}">Open</button><button class="btn btn-ghost btn-sm" data-action="edit-class" data-id="${esc(c.id)}">Edit</button><button class="btn btn-danger btn-sm" data-action="archive-class" data-id="${esc(c.id)}">Archive</button></div></div>`;
+}
+
+function classDashboard(c) {
+  const info = (l, v) => `<div><div class="muted small">${l}</div><b>${v ? esc(v) : '—'}</b></div>`;
+  return `<div style="margin-bottom:12px"><a class="btn btn-ghost btn-sm" href="#/app/faculty/classes">← All classes</a></div>
+  <div class="card"><div class="row between wrap"><div><h3 style="margin:0">${esc(c.name)}</h3><div class="muted small" style="margin-top:4px">${esc(classTag(c))}</div></div>
+      <span class="chip ${c.archived ? 'warn' : 'ok'}">${c.archived ? 'Archived' : 'Active'}</span></div>
+    <div class="grid g3" style="margin-top:14px">${info('Course', c.course)}${info('Department', c.department)}${info('Academic year', c.academicYear)}${info('Semester', String(c.semester))}${info('Section', c.section)}${info('Subject', c.subject)}</div>
+    <div class="row wrap" style="margin-top:16px"><button class="btn btn-ghost btn-sm" data-action="edit-class" data-id="${esc(c.id)}">Edit details</button>
+      ${c.archived ? `<button class="btn btn-ghost btn-sm" data-action="restore-class" data-id="${esc(c.id)}">Restore class</button>` : `<button class="btn btn-danger btn-sm" data-action="archive-class" data-id="${esc(c.id)}">Archive class</button>`}</div></div>
+  <div class="card"><h3>Joining this class</h3>
+    <div class="muted small">Join code</div>
+    <div style="font-size:1.6rem;letter-spacing:.18em;font-weight:700;margin:4px 0 12px" class="grad">${esc(codeFmt(c.codeKey))}</div>
+    <div class="row wrap"><button class="btn btn-ghost btn-sm" data-action="copy-text" data-text="${esc(c.codeKey)}" data-what="Join code">${icon('file')} Copy code</button>
+      <button class="btn btn-ghost btn-sm" data-action="reset-pass" data-id="${esc(c.id)}">${icon('lock')} Reset password</button></div>
+    <p class="muted small" style="margin-top:12px">The enrollment password is never stored or shown again after it is created. If you lose it, reset it to get a new one.</p></div>
+  <div class="grid g4 stats-row">${stat('users', 0, 'Enrolled students')}${stat('inbox', 0, 'Pending join requests')}</div>
+  <div class="grid g2">
+    <div class="card"><h3>Enrolled students</h3>${emptyState('users', 'No students yet', 'Students will appear here once they join or you add them. Roster tools are the next step.')}</div>
+    <div class="card"><h3>Pending join requests</h3>${emptyState('inbox', 'No join requests', 'Student join requests are the next step. Nobody can request to join yet.')}</div>
+  </div>`;
+}
+
+function facultyClassesReal() {
+  const k = State.cls;
+  const head = `<div class="row between wrap"><p class="muted">Create and manage your classes. Each class has an 8-character join code and a separate enrollment password.</p><button class="btn btn-primary" data-action="new-class">${icon('plus')} New class</button></div>`;
+  if (k.status === 'idle' || k.status === 'loading') return banner() + head + skeletons();
+  if (k.status === 'error') return `${banner()}<div class="notice bad" role="alert"><b>Could not load your classes.</b> ${esc(k.error || '')}</div><div style="margin-top:12px"><button class="btn btn-primary" data-action="reload-classes">Try again</button></div>`;
+  if (State.classOpen) {
+    const c = State.classes.find(x => x.id === State.classOpen);
+    return banner() + (c ? classDashboard(c) : `<div class="card">${emptyState('book', 'Class not found', 'This class does not exist or does not belong to you.')}<a class="btn btn-ghost" href="#/app/faculty/classes">Back to classes</a></div>`);
+  }
+  const act = State.classes.filter(c => !c.archived), arch = State.classes.filter(c => c.archived);
+  return `${banner()}${head}
+  <div class="grid g3">${act.map(classCard).join('') || `<div class="card" style="grid-column:1/-1">${emptyState('book', 'No classes yet', 'Create your first class to get a join code and password.')}</div>`}</div>
+  ${arch.length ? `<div class="card"><h3>Archived</h3><div class="list">${arch.map(c => `<div class="item"><div class="grow"><b>${esc(c.name)}</b><div class="muted small">${esc(classTag(c))}</div></div><a class="btn btn-ghost btn-sm" href="#/app/faculty/classes/${esc(c.id)}">Open</a><button class="btn btn-ghost btn-sm" data-action="restore-class" data-id="${esc(c.id)}">Restore</button></div>`).join('')}</div></div>` : ''}`;
+}
+
 V.classes = () => {
+  if (!State.demo && State.role === 'faculty') return facultyClassesReal();
   if (State.role === 'student') {
     const rows = State.myJoin.map(j => `<div class="item"><div class="grow"><b>${esc(j.cls)}</b><div class="muted small">Requested ${j.when}</div></div><span class="chip ${chipFor(j.status)}">${j.status}</span></div>`).join('');
     return `${banner(3)}<div class="card"><div class="row between wrap"><h3>My classes and join requests</h3><button class="btn btn-primary btn-sm" data-action="join-class">${icon('plus')} Join a class</button></div><div class="list">${rows || emptyState('book', 'No classes yet', 'Use a six-digit code and the class password to request access.')}</div></div>`;
