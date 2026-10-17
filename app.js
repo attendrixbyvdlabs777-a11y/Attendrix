@@ -321,6 +321,7 @@ function importDialog() {
 }
 
 /* ---------- Phase 3: classes (real mode) ---------- */
+const BUILD = '3a-2';
 let modalLocked = false, opBusy = false;
 
 /* Loads the signed-in faculty member's classes. Quiet: it does not blank the page. */
@@ -334,13 +335,13 @@ async function fetchClasses() {
   } catch (e) {
     if (!State.auth.user || State.auth.user.uid !== uid) return;
     let msg = e.message;
-    // A refusal is either "new rules not published" or "roles document is not exactly right". Show what the roles document holds.
+    // A refusal is either "new rules not published" or "roles document is not exactly right". Check both and say which.
     if (e && e.code === 'permission-denied') {
-      const d = await withTimeout(B.inspectRoles(uid), 6000, null);
+      const [probe, d] = await Promise.all([withTimeout(B.probeRules(), 6000, 'unknown'), withTimeout(B.inspectRoles(uid), 6000, null)]);
       if (!State.auth.user || State.auth.user.uid !== uid) return;
-      if (d) msg += d.exists
-        ? ` What your roles document holds right now: field "roles" is of type ${d.type}, value ${d.valueText || '(empty)'}. It must be type array with value ["faculty"]. If it already is, the new rules are not published yet.`
-        : ` There is no document at roles/${uid}.`;
+      msg = `Firestore refused to list your classes. [Build ${BUILD}] ` +
+        `New rules: ${probe === 'published' ? 'PUBLISHED' : probe === 'not-published' ? 'NOT PUBLISHED. Publish firestore.rules in the Firebase console, then tap Try again.' : 'could not be checked.'} ` +
+        (d ? (d.exists ? `Roles document: field "roles" is type ${d.type}, value ${d.valueText || '(empty)'}. It must be type array with value ["faculty"].` : `Roles document: none exists at roles/${uid}.`) : 'Roles document: could not be read.');
     }
     State.cls = { status: 'error', error: msg };
   }
