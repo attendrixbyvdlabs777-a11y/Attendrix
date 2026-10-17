@@ -233,8 +233,21 @@
       const uid = meUid(), { db, fsM } = fb;
       const snap = await fsM.getDocs(fsM.query(fsM.collection(db, 'classes'), fsM.where('ownerUid', '==', uid)));
       const out = []; snap.forEach(d => out.push(toClass(d.id, d.data())));
-      return out.sort((a, b) => b.createdMs - a.createdMs || a.name.localeCompare(b.name));
+      out.sort((a, b) => b.createdMs - a.createdMs || a.name.localeCompare(b.name));
+      backfillCodes(out, uid); // background, never blocks or fails the list
+      return out;
     } catch (e) { throw classErr(e); }
+  }
+  /* Classes created before step 3b have a public lookup without className/ownerUid. Add them (owner only). */
+  async function backfillCodes(list, uid) {
+    const { db, fsM } = fb;
+    await Promise.allSettled(list.slice(0, 40).map(async c => {
+      const ref = fsM.doc(db, 'classCodes', c.codeKey), snap = await fsM.getDoc(ref);
+      if (!snap.exists()) return;
+      const d = snap.data();
+      if (d.className === c.name && d.ownerUid === uid) return;
+      await fsM.updateDoc(ref, { className: c.name, ownerUid: uid });
+    }));
   }
 
   /* Creates the class, its public code lookup and its hashed secret in ONE atomic batch.
@@ -252,7 +265,7 @@
         const sec = await newSecret();
         const batch = fsM.writeBatch(db);
         batch.set(classRef, { ownerUid: uid, ...classFields(fields), status: 'active', codeKey: code, createdAt: fsM.serverTimestamp(), updatedAt: fsM.serverTimestamp() });
-        batch.set(codeRef, { classId: classRef.id, salt: sec.saltHex, iter: sec.iter });
+        batch.set(codeRef, { classId: classRef.id, ownerUid: uid, className: fields.name, salt: sec.saltHex, iter: sec.iter });
         batch.set(fsM.doc(db, 'classSecrets', classRef.id), { verifier: sec.verifier });
         await batch.commit();
         return { id: classRef.id, code, password: sec.password };
@@ -261,12 +274,17 @@
     throw lastErr ? classErr(lastErr) : new Error('Could not find a free class code. Please try again.');
   }
 
-  async function updateClass(id, fields) {
+  /* `c` is the class being edited (needs id, codeKey, name). The public lookup keeps a copy of the class name,
+     so it is updated in the SAME batch when the name changes. */
+  async function updateClass(c, fields) {
     try {
       const { db, fsM } = fb; meUid();
       const data = { ...classFields(fields), updatedAt: fsM.serverTimestamp() };
       if (!fields.subject) data.subject = fsM.deleteField();
-      await fsM.updateDoc(fsM.doc(db, 'classes', id), data);
+      const batch = fsM.writeBatch(db);
+      batch.update(fsM.doc(db, 'classes', c.id), data);
+      if (fields.name !== c.name) batch.update(fsM.doc(db, 'classCodes', c.codeKey), { className: fields.name });
+      await batch.commit();
     } catch (e) { throw classErr(e); }
   }
   async function setClassStatus(id, status) {
@@ -276,25 +294,116 @@
     } catch (e) { throw classErr(e); }
   }
   /* New random password with a new salt. The old password stops working for new join requests. */
-  async function resetClassPassword(id, codeKey) {
+  async function resetClassPassword(id, codeKey, className) {
     try {
-      const { db, fsM } = fb; meUid();
+      const { db, fsM } = fb; const uid = meUid();
       const sec = await newSecret();
       const batch = fsM.writeBatch(db);
-      batch.update(fsM.doc(db, 'classCodes', codeKey), { salt: sec.saltHex, iter: sec.iter });
+      batch.update(fsM.doc(db, 'classCodes', codeKey), { salt: sec.saltHex, iter: sec.iter, className, ownerUid: uid });
       batch.update(fsM.doc(db, 'classSecrets', id), { verifier: sec.verifier });
       await batch.commit();
       return { password: sec.password };
     } catch (e) { throw classErr(e); }
   }
 
-  /* Tells whether the Phase 3 rules are published: the new rules let any signed-in user "get" a classCodes
-     document (even a missing one); the old deny-all rules refuse it. Reads nothing private. */
+  /* ================= Phase 3b: joining and approving ================= */
+  const CODE_RE = /^[A-HJ-NP-Z2-9]{8}$/, PASS_RE = /^[A-HJ-NP-Z2-9]{12}$/;
+  const normCode = c => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const appErr = (msg, code) => { const e = new Error(msg); e.code = code || 'app/invalid'; return e; };
+  const dateText = ts => { try { return ts && ts.toDate ? ts.toDate().toISOString().slice(0, 10) : ''; } catch (e) { return ''; } };
+  const STATUS_TEXT = { pending: 'Pending', approved: 'Approved', rejected: 'Rejected' };
+  function joinErr(e) {
+    if (e && e.code === 'permission-denied') {
+      const err = new Error('Firestore refused this. Check that the latest firestore.rules is published in the Firebase console.');
+      err.code = 'permission-denied'; return err;
+    }
+    return e && /^app\//.test(e.code || '') ? e : wrap(e);
+  }
+  const toRequest = (id, d) => ({
+    id, classId: d.classId, studentUid: d.studentUid, ownerUid: d.ownerUid, cls: d.className || '', student: d.displayName || d.email || '',
+    email: d.email || '', photoURL: d.photoURL || null, status: STATUS_TEXT[d.status] || 'Pending', raw: d.status, when: dateText(d.createdAt)
+  });
+
+  /* Student: ask to join a class. Returns { already: status } or { className }. */
+  async function requestJoin(codeRaw, passRaw) {
+    try {
+      const { db, fsM } = fb, u = fb.auth.currentUser;
+      if (!u) throw appErr('You are not signed in. Sign in again and retry.', 'app/not-signed-in');
+      const code = normCode(codeRaw), pass = normSecret(passRaw);
+      if (!CODE_RE.test(code)) throw appErr('The class code is 8 characters (letters and numbers).');
+      if (!PASS_RE.test(pass)) throw appErr('The class password is 12 characters (letters and numbers), like ABCD-EFGH-JKLM.');
+      let snap;
+      try { snap = await fsM.getDoc(fsM.doc(db, 'classCodes', code)); }
+      catch (e) { throw joinErr(e); }
+      if (!snap.exists()) throw appErr('No class was found for that code. Check it and try again.', 'app/no-class');
+      const c = snap.data();
+      if (!c.className || !c.ownerUid || !c.salt) throw appErr('This class is not ready for join requests yet. Ask the faculty member to open the Classes page once, then try again.', 'app/not-ready');
+      const reqRef = fsM.doc(db, 'joinRequests', c.classId + '_' + u.uid);
+      let ex;
+      try { ex = await fsM.getDoc(reqRef); } catch (e) { throw joinErr(e); }
+      if (ex.exists()) return { already: ex.data().status, className: c.className };
+      const proof = await derive(pass, c.salt, c.iter);
+      try {
+        await fsM.setDoc(reqRef, {
+          classId: c.classId, ownerUid: c.ownerUid, studentUid: u.uid, className: c.className,
+          displayName: u.displayName || u.email || 'Student', email: u.email || '', photoURL: u.photoURL || null,
+          status: 'pending', proof, createdAt: fsM.serverTimestamp()
+        });
+      } catch (e) {
+        if (e && e.code === 'permission-denied') throw appErr('The request was not accepted. The most likely reason is a wrong class password. It can also mean the class is archived, you are already enrolled, or the latest rules are not published.', 'permission-denied');
+        throw joinErr(e);
+      }
+      return { className: c.className };
+    } catch (e) { throw e && /^(app\/|permission-denied)/.test(e.code || '') ? e : joinErr(e); }
+  }
+  async function listMyRequests() {
+    try {
+      const { db, fsM } = fb, uid = meUid();
+      const snap = await fsM.getDocs(fsM.query(fsM.collection(db, 'joinRequests'), fsM.where('studentUid', '==', uid)));
+      const out = []; snap.forEach(d => out.push(toRequest(d.id, d.data())));
+      return out.sort((a, b) => b.when.localeCompare(a.when));
+    } catch (e) { throw joinErr(e); }
+  }
+  async function cancelRequest(id) {
+    try { await fb.fsM.deleteDoc(fb.fsM.doc(fb.db, 'joinRequests', id)); } catch (e) { throw joinErr(e); }
+  }
+  /* Faculty: every pending request for the signed-in faculty member's classes. */
+  async function listPendingRequests() {
+    try {
+      const { db, fsM } = fb, uid = meUid();
+      const snap = await fsM.getDocs(fsM.query(fsM.collection(db, 'joinRequests'), fsM.where('ownerUid', '==', uid), fsM.where('status', '==', 'pending')));
+      const out = []; snap.forEach(d => out.push(toRequest(d.id, d.data())));
+      return out.sort((a, b) => a.when.localeCompare(b.when));
+    } catch (e) { throw joinErr(e); }
+  }
+  async function listMembers(classId) {
+    try {
+      const { db, fsM } = fb; meUid();
+      const snap = await fsM.getDocs(fsM.collection(db, 'classes', classId, 'members'));
+      const out = []; snap.forEach(d => { const x = d.data(); out.push({ uid: d.id, name: x.displayName || x.email || '', email: x.email || '', photoURL: x.photoURL || null, joined: dateText(x.joinedAt) }); });
+      return out.sort((a, b) => a.name.localeCompare(b.name));
+    } catch (e) { throw joinErr(e); }
+  }
+  /* Faculty: approve or reject. Approving writes the request update AND the member document in one batch. */
+  async function decideRequest(r, approve) {
+    try {
+      const { db, fsM } = fb, uid = meUid();
+      const batch = fsM.writeBatch(db);
+      batch.update(fsM.doc(db, 'joinRequests', r.id), { status: approve ? 'approved' : 'rejected', decidedAt: fsM.serverTimestamp(), decidedBy: uid });
+      if (approve) batch.set(fsM.doc(db, 'classes', r.classId, 'members', r.studentUid), {
+        studentUid: r.studentUid, displayName: r.student, email: r.email, photoURL: r.photoURL, joinedAt: fsM.serverTimestamp()
+      });
+      await batch.commit();
+    } catch (e) { throw joinErr(e); }
+  }
+  /* Is the latest rules file published? The 3b rules let any signed-in user "get" their own joinRequests id
+     (even a missing one); older rules refuse it. Reads nothing private. */
   async function probeRules() {
-    try { await fb.fsM.getDoc(fb.fsM.doc(fb.db, 'classCodes', 'ZZZZZZZZ')); return 'published'; }
+    try { await fb.fsM.getDoc(fb.fsM.doc(fb.db, 'joinRequests', 'ZZZZZZZZ_' + meUid())); return 'published'; }
     catch (e) { return e && e.code === 'permission-denied' ? 'not-published' : 'unknown'; }
   }
 
   window.AttendrixBackend = { init, onAuth, signIn, signOut, syncProfile, loadRoles, inspectRoles, isConfigured, probeRules,
-    listClasses, createClass, updateClass, setClassStatus, resetClassPassword, _derive: derive, _newSecret: newSecret };
+    listClasses, createClass, updateClass, setClassStatus, resetClassPassword,
+    requestJoin, listMyRequests, cancelRequest, listPendingRequests, listMembers, decideRequest, _derive: derive, _newSecret: newSecret };
 })();
