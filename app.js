@@ -81,7 +81,8 @@ function renderRoute() {
     if (!NAV[p[1]] || !allowedRoles().includes(p[1])) { app.innerHTML = deniedView(p[1]); return; }
     setView(p[1], p[2]);
     State.classOpen = (p[1] === 'faculty' && p[2] === 'classes' && p[3]) ? p[3] : null;
-    if (p[1] === 'faculty') ensureClasses();
+    if (p[1] === 'faculty') { ensureClasses(); ensurePending(); if (State.classOpen) ensureMembers(State.classOpen); }
+    if (p[1] === 'student') ensureMyJoin();
     app.innerHTML = shell(currentView());
     return;
   }
@@ -122,7 +123,11 @@ async function onUser(user, err) {
   const seq = ++authSeq;
   // Never show one account's classes to another: clear everything on every sign-in / sign-out.
   // (Demo mode keeps its own sample classes; leaving demo reloads empty data anyway.)
-  if (!State.demo) { State.classes = []; State.cls = { status: 'idle', error: null }; State.classOpen = null; }
+  if (!State.demo) {
+    State.classes = []; State.cls = { status: 'idle', error: null }; State.classOpen = null;
+    State.joinRequests = []; State.myJoin = []; State.members = {};
+    State.jr = { status: 'idle', error: null }; State.myJ = { status: 'idle', error: null };
+  }
   if (!user) {
     State.auth = { status: 'signedOut', user: null, roles: [], warning: null, error: err ? err.message : null };
     if (err) State.authError = err.message;
@@ -321,7 +326,7 @@ function importDialog() {
 }
 
 /* ---------- Phase 3: classes (real mode) ---------- */
-const BUILD = '3a-2';
+const BUILD = '3b-1';
 let modalLocked = false, opBusy = false;
 
 /* Loads the signed-in faculty member's classes. Quiet: it does not blank the page. */
@@ -351,6 +356,104 @@ function ensureClasses() {
   if (State.demo || State.cls.status !== 'idle') return;
   State.cls = { status: 'loading', error: null };
   fetchClasses();
+}
+
+/* A refusal is usually "latest rules not published". Say so when the probe confirms it. */
+async function deniedNote(e) {
+  if (!(e && e.code === 'permission-denied')) return e.message;
+  const probe = await withTimeout(B.probeRules(), 6000, 'unknown');
+  return e.message + ` [Build ${BUILD}] New rules: ${probe === 'published' ? 'PUBLISHED' : probe === 'not-published' ? 'NOT PUBLISHED. Publish firestore.rules in the Firebase console, then tap Try again.' : 'could not be checked.'}`;
+}
+const sameUser = uid => State.auth.user && State.auth.user.uid === uid;
+
+async function fetchPending() {
+  const uid = State.auth.user && State.auth.user.uid; if (!uid || !B) return;
+  try { const list = await B.listPendingRequests(); if (!sameUser(uid)) return; State.joinRequests = list; State.jr = { status: 'ready', error: null }; }
+  catch (e) { const m = await deniedNote(e); if (!sameUser(uid)) return; State.jr = { status: 'error', error: m }; }
+  refresh();
+}
+function ensurePending() {
+  if (State.demo || State.jr.status !== 'idle') return;
+  State.jr = { status: 'loading', error: null }; fetchPending();
+}
+async function fetchMyJoin() {
+  const uid = State.auth.user && State.auth.user.uid; if (!uid || !B) return;
+  try { const list = await B.listMyRequests(); if (!sameUser(uid)) return; State.myJoin = list; State.myJ = { status: 'ready', error: null }; }
+  catch (e) { const m = await deniedNote(e); if (!sameUser(uid)) return; State.myJ = { status: 'error', error: m }; }
+  refresh();
+}
+function ensureMyJoin() {
+  if (State.demo || State.myJ.status !== 'idle') return;
+  State.myJ = { status: 'loading', error: null }; fetchMyJoin();
+}
+async function fetchMembers(classId) {
+  const uid = State.auth.user && State.auth.user.uid; if (!uid || !B) return;
+  try { const list = await B.listMembers(classId); if (!sameUser(uid)) return; State.members[classId] = { status: 'ready', list, error: null }; }
+  catch (e) { const m = await deniedNote(e); if (!sameUser(uid)) return; State.members[classId] = { status: 'error', list: [], error: m }; }
+  refresh();
+}
+function ensureMembers(classId) {
+  if (State.demo || State.members[classId]) return;
+  State.members[classId] = { status: 'loading', list: [], error: null }; fetchMembers(classId);
+}
+
+/* Faculty: approve or reject a pending join request. */
+async function decideNow(id, approve) {
+  const r = State.joinRequests.find(x => x.id === id);
+  if (!r || opBusy) return;
+  opBusy = true;
+  try {
+    await B.decideRequest(r, approve);
+    toast(approve ? `${r.student} was added to the class.` : 'Request rejected.', approve ? 'ok' : 'info');
+    await Promise.all([fetchPending(), fetchMembers(r.classId)]);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { opBusy = false; }
+}
+function rejectDialog(r) {
+  openModal({
+    title: 'Reject this request?',
+    body: `<div id="f-formerr"></div><p class="muted">${esc(r.student)} (${esc(r.email)}) will not be added to “${esc(r.cls)}”. They can ask again later.</p>`,
+    actions: [{ label: 'Cancel' }, {
+      label: 'Reject', cls: 'btn-danger',
+      onClick() { runDialog(() => B.decideRequest(r, false), async () => { toast('Request rejected.', 'info'); await fetchPending(); }, 'Rejecting…'); return false; }
+    }]
+  });
+}
+
+/* Student: join a class with its code and password. */
+const CODE_FORM = /^[A-HJ-NP-Z2-9]{8}$/, PASS_FORM = /^[A-HJ-NP-Z2-9]{12}$/;
+function joinClassDialogReal() {
+  openModal({
+    title: 'Join a class',
+    body: '<div id="f-formerr"></div>' +
+      field('f-code', 'Class code (8 characters)', inputHtml('f-code', 'maxlength="12" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD EFGH"')) +
+      field('f-jpass', 'Class password (12 characters)', inputHtml('f-jpass', 'maxlength="20" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH-JKLM"')) +
+      '<div class="notice info">Your faculty member gives you the code and the password. Your request is sent to them for approval.</div>',
+    actions: [{ label: 'Cancel' }, {
+      label: 'Send request', cls: 'btn-primary',
+      onClick() {
+        const code = val('f-code').toUpperCase().replace(/[^A-Z0-9]/g, ''), pass = val('f-jpass').toUpperCase().replace(/[\s-]+/g, '');
+        let bad = setErr('f-code', CODE_FORM.test(code) ? '' : 'The code is 8 letters and numbers.');
+        bad = setErr('f-jpass', PASS_FORM.test(pass) ? '' : 'The password is 12 letters and numbers, like ABCD-EFGH-JKLM.') || bad;
+        if (bad) return false;
+        runDialog(() => B.requestJoin(code, pass), async r => {
+          toast(r.already ? `You already have a request for “${r.className}” (${r.already}).` : `Request sent to “${r.className}”. It now waits for approval.`, r.already ? 'info' : 'ok');
+          await fetchMyJoin();
+        }, 'Sending…');
+        return false;
+      }
+    }]
+  });
+}
+function cancelJoinDialog(j) {
+  openModal({
+    title: j.status === 'Pending' ? 'Cancel this request?' : 'Remove this request?',
+    body: `<div id="f-formerr"></div><p class="muted">“${esc(j.cls)}”. You can send a new request later with the class code and password.</p>`,
+    actions: [{ label: 'Keep it' }, {
+      label: j.status === 'Pending' ? 'Cancel request' : 'Remove', cls: 'btn-danger',
+      onClick() { runDialog(() => B.cancelRequest(j.id), async () => { toast('Request removed.', 'info'); await fetchMyJoin(); }, 'Working…'); return false; }
+    }]
+  });
 }
 
 function setModalBusy(on, label) {
@@ -419,7 +522,7 @@ function classFormDialog(existing) {
       label: existing ? 'Save' : 'Create class', cls: 'btn-primary',
       onClick() {
         const f = readClassForm(); if (!f) return false;
-        if (existing) runDialog(() => B.updateClass(existing.id, f), async () => { toast('Class updated.'); await fetchClasses(); }, 'Saving…');
+        if (existing) runDialog(() => B.updateClass(existing, f), async () => { toast('Class updated.'); await fetchClasses(); }, 'Saving…');
         else runDialog(() => B.createClass(f), async r => { secretDialog({ title: 'Class created', name: f.name, code: r.code, password: r.password }); await fetchClasses(); }, 'Creating…');
         return false;
       }
@@ -449,7 +552,7 @@ function resetPassDialog(c) {
     body: `<div id="f-formerr"></div><p class="muted">A new random password will be created for “${esc(c.name)}”. The old password stops working for new join requests. Students who are already enrolled are not affected.</p>`,
     actions: [{ label: 'Cancel' }, {
       label: 'Reset password', cls: 'btn-primary',
-      onClick() { runDialog(() => B.resetClassPassword(c.id, c.codeKey), r => secretDialog({ title: 'New password', name: c.name, password: r.password }), 'Resetting…'); return false; }
+      onClick() { runDialog(() => B.resetClassPassword(c.id, c.codeKey, c.name), r => secretDialog({ title: 'New password', name: c.name, password: r.password }), 'Resetting…'); return false; }
     }]
   });
 }
@@ -458,7 +561,6 @@ const classById = id => State.classes.find(c => c.id === id);
 /* ---------- click actions ---------- */
 /* Features that are not built yet. In real mode they say so instead of pretending to save. */
 const STAGE_FOR = {
-  'join-approve': 3, 'join-reject': 3, 'join-class': 3,
   'add-student': 4, import: 4, 'delete-selected': 4,
   mark: 5, 'mark-all': 5, finalize: 5, pdf: 6,
   'req-approve': 7, 'req-reject': 7, 'new-request': 7,
@@ -483,8 +585,18 @@ const Actions = {
   'open-class': el => { location.hash = `${base()}faculty/classes/${el.dataset.id}`; },
   'reload-classes': () => { State.cls = { status: 'loading', error: null }; refresh(); fetchClasses(); },
   'reset-pass': el => { const c = classById(el.dataset.id); if (c) resetPassDialog(c); },
-  'join-approve': el => { State.joinRequests.find(j => j.id === el.dataset.id).status = 'Approved'; toast('Join request approved (demo only).'); refresh(); },
-  'join-reject': el => { State.joinRequests.find(j => j.id === el.dataset.id).status = 'Rejected'; toast('Join request rejected (demo only).', 'info'); refresh(); },
+  'join-approve': el => {
+    if (!State.demo) return decideNow(el.dataset.id, true);
+    State.joinRequests.find(j => j.id === el.dataset.id).status = 'Approved'; toast('Join request approved (demo only).'); refresh();
+  },
+  'join-reject': el => {
+    if (State.demo) { State.joinRequests.find(j => j.id === el.dataset.id).status = 'Rejected'; toast('Join request rejected (demo only).', 'info'); return refresh(); }
+    const r = State.joinRequests.find(x => x.id === el.dataset.id); if (r) rejectDialog(r);
+  },
+  'cancel-join': el => { const j = State.myJoin.find(x => x.id === el.dataset.id); if (j) cancelJoinDialog(j); },
+  'reload-requests': () => {
+    State.jr = { status: 'idle', error: null }; State.myJ = { status: 'idle', error: null }; State.members = {}; refresh();
+  },
   'new-announcement': announceDialog,
   'new-class': () => State.demo ? newClassDialog() : classFormDialog(null),
   'edit-class': el => { const c = classById(el.dataset.id); if (!c) return; State.demo ? newClassDialog(c) : classFormDialog(c); },
@@ -496,7 +608,7 @@ const Actions = {
     const c = classById(el.dataset.id); if (!c) return;
     if (State.demo) { c.archived = false; toast('Class restored.'); refresh(); } else restoreClass(c);
   },
-  'join-class': joinClassDialog,
+  'join-class': () => State.demo ? joinClassDialog() : joinClassDialogReal(),
   mark: el => { const m = State.att.marks; m[el.dataset.id] = m[el.dataset.id] === el.dataset.v ? undefined : el.dataset.v; refresh(); },
   'mark-all': () => { State.roster.forEach(s => State.att.marks[s.id] = 'P'); refresh(); },
   finalize: finalizeDialog,
