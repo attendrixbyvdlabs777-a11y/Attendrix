@@ -167,5 +167,127 @@
     } catch (e) { throw wrap(e); }
   }
 
-  window.AttendrixBackend = { init, onAuth, signIn, signOut, syncProfile, loadRoles, inspectRoles, isConfigured };
+  /* ================= Phase 3: classes =================
+     Enrollment password design (no server is available on the free plan):
+       - The app generates the password (12 random characters, ~60 bits). It is shown once and never stored.
+       - Only PBKDF2-SHA256(password, salt) is stored, in classSecrets/{classId}, which no browser can read.
+       - A student's browser will compute the same hash and send it as "proof"; the Firestore rules
+         accept a join request only if the proof equals the stored hash (step 3b).
+       - Limit: rules cannot count failed attempts, so there is no lockout. A long random
+         password is the protection. */
+  const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 32 symbols, no I, O, 0, 1
+  const PBKDF2_ITER = 210000;
+
+  function randomString(n) {
+    const b = new Uint8Array(n); crypto.getRandomValues(b);
+    let s = ''; for (const x of b) s += ALPHABET[x & 31]; // 256 is a multiple of 32, so no bias
+    return s;
+  }
+  const toHex = buf => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  const fromHex = h => new Uint8Array(h.match(/../g).map(x => parseInt(x, 16)));
+  const normSecret = p => String(p).toUpperCase().replace(/[\s-]+/g, '');
+  const groupPassword = p => p.match(/.{1,4}/g).join('-');
+
+  async function derive(password, saltHex, iter) {
+    if (!(window.crypto && crypto.subtle)) throw new Error('This browser cannot do secure hashing. Open the site from its https:// address in an up-to-date browser.');
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(normSecret(password)), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: fromHex(saltHex), iterations: iter }, key, 256);
+    return toHex(bits);
+  }
+  async function newSecret() {
+    const password = randomString(12);
+    const saltHex = toHex(crypto.getRandomValues(new Uint8Array(16)));
+    return { password: groupPassword(password), saltHex, iter: PBKDF2_ITER, verifier: await derive(password, saltHex, PBKDF2_ITER) };
+  }
+
+  function meUid() {
+    const u = fb && fb.auth && fb.auth.currentUser;
+    if (!u) { const e = new Error('You are not signed in. Sign in again and retry.'); e.code = 'app/not-signed-in'; throw e; }
+    return u.uid;
+  }
+  /* Class errors: a refused write usually means the rules are not published or the role is wrong. */
+  function classErr(e) {
+    if (e && e.code === 'permission-denied') {
+      const err = new Error('Firestore refused this. Check that (1) the new rules are published, and (2) your roles document is exactly: field roles, type array, item "faculty" in lowercase.');
+      err.code = 'permission-denied'; return err;
+    }
+    return e && e.code === 'app/not-signed-in' ? e : wrap(e);
+  }
+  function toClass(id, d) {
+    const ms = d.createdAt && typeof d.createdAt.toMillis === 'function' ? d.createdAt.toMillis() : 0;
+    return {
+      id, name: d.name || '', course: d.course || '', department: d.department || '', academicYear: d.academicYear || '',
+      semester: d.semester, section: d.section || '', subject: d.subject || '', codeKey: d.codeKey || '',
+      status: d.status === 'archived' ? 'archived' : 'active', archived: d.status === 'archived',
+      students: null, att: null, createdMs: ms
+    };
+  }
+  const classFields = f => {
+    const o = { name: f.name, course: f.course, department: f.department, academicYear: f.academicYear, semester: f.semester, section: f.section };
+    if (f.subject) o.subject = f.subject;
+    return o;
+  };
+
+  async function listClasses() {
+    try {
+      const uid = meUid(), { db, fsM } = fb;
+      const snap = await fsM.getDocs(fsM.query(fsM.collection(db, 'classes'), fsM.where('ownerUid', '==', uid)));
+      const out = []; snap.forEach(d => out.push(toClass(d.id, d.data())));
+      return out.sort((a, b) => b.createdMs - a.createdMs || a.name.localeCompare(b.name));
+    } catch (e) { throw classErr(e); }
+  }
+
+  /* Creates the class, its public code lookup and its hashed secret in ONE atomic batch.
+     Returns the plain password ONCE; it is not stored anywhere. */
+  async function createClass(fields) {
+    const { db, fsM } = fb;
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const uid = meUid();
+        const code = randomString(8);
+        const codeRef = fsM.doc(db, 'classCodes', code);
+        if ((await fsM.getDoc(codeRef)).exists()) continue; // code already taken, pick another
+        const classRef = fsM.doc(fsM.collection(db, 'classes'));
+        const sec = await newSecret();
+        const batch = fsM.writeBatch(db);
+        batch.set(classRef, { ownerUid: uid, ...classFields(fields), status: 'active', codeKey: code, createdAt: fsM.serverTimestamp(), updatedAt: fsM.serverTimestamp() });
+        batch.set(codeRef, { classId: classRef.id, salt: sec.saltHex, iter: sec.iter });
+        batch.set(fsM.doc(db, 'classSecrets', classRef.id), { verifier: sec.verifier });
+        await batch.commit();
+        return { id: classRef.id, code, password: sec.password };
+      } catch (e) { lastErr = e; if (!(e && e.code === 'permission-denied') || attempt === 2) break; }
+    }
+    throw lastErr ? classErr(lastErr) : new Error('Could not find a free class code. Please try again.');
+  }
+
+  async function updateClass(id, fields) {
+    try {
+      const { db, fsM } = fb; meUid();
+      const data = { ...classFields(fields), updatedAt: fsM.serverTimestamp() };
+      if (!fields.subject) data.subject = fsM.deleteField();
+      await fsM.updateDoc(fsM.doc(db, 'classes', id), data);
+    } catch (e) { throw classErr(e); }
+  }
+  async function setClassStatus(id, status) {
+    try {
+      const { db, fsM } = fb; meUid();
+      await fsM.updateDoc(fsM.doc(db, 'classes', id), { status, updatedAt: fsM.serverTimestamp() });
+    } catch (e) { throw classErr(e); }
+  }
+  /* New random password with a new salt. The old password stops working for new join requests. */
+  async function resetClassPassword(id, codeKey) {
+    try {
+      const { db, fsM } = fb; meUid();
+      const sec = await newSecret();
+      const batch = fsM.writeBatch(db);
+      batch.update(fsM.doc(db, 'classCodes', codeKey), { salt: sec.saltHex, iter: sec.iter });
+      batch.update(fsM.doc(db, 'classSecrets', id), { verifier: sec.verifier });
+      await batch.commit();
+      return { password: sec.password };
+    } catch (e) { throw classErr(e); }
+  }
+
+  window.AttendrixBackend = { init, onAuth, signIn, signOut, syncProfile, loadRoles, inspectRoles, isConfigured,
+    listClasses, createClass, updateClass, setClassStatus, resetClassPassword, _derive: derive, _newSecret: newSecret };
 })();
