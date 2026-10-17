@@ -288,6 +288,13 @@
     } catch (e) { throw classErr(e); }
   }
 
-  window.AttendrixBackend = { init, onAuth, signIn, signOut, syncProfile, loadRoles, inspectRoles, isConfigured,
+  /* Tells whether the Phase 3 rules are published: the new rules let any signed-in user "get" a classCodes
+     document (even a missing one); the old deny-all rules refuse it. Reads nothing private. */
+  async function probeRules() {
+    try { await fb.fsM.getDoc(fb.fsM.doc(fb.db, 'classCodes', 'ZZZZZZZZ')); return 'published'; }
+    catch (e) { return e && e.code === 'permission-denied' ? 'not-published' : 'unknown'; }
+  }
+
+  window.AttendrixBackend = { init, onAuth, signIn, signOut, syncProfile, loadRoles, inspectRoles, isConfigured, probeRules,
     listClasses, createClass, updateClass, setClassStatus, resetClassPassword, _derive: derive, _newSecret: newSecret };
 })();
