@@ -1,8 +1,8 @@
 rules_version = '2';
 
-// ATTENDRIX – Firestore security rules (Stage 2)
-// Default is DENY. Only the two rules below grant access; everything else stays closed.
-// Later stages add explicit rules for classes, rosters, attendance, chat, etc.
+// ATTENDRIX – Firestore security rules (Phase 3, step 3a: classes)
+// Default is DENY. Only the rules below grant access; everything else stays closed.
+// Later steps add explicit rules for join requests, rosters, attendance, chat, etc.
 //
 // Publish: Firebase console > Firestore Database > Rules > paste this file > Publish.
 
@@ -25,6 +25,35 @@ service cloud.firestore {
         && d.lastLoginAt == request.time;
     }
 
+    // True only for a signed-in user whose roles/{uid} document lists "faculty".
+    // Roles are written by an administrator in the console, never from a browser.
+    // If the document or its "roles" field is missing, the rule errors and the request is denied.
+    function isFaculty() {
+      return signedIn()
+        && get(/databases/$(database)/documents/roles/$(request.auth.uid)).data.roles.hasAny(['faculty']);
+    }
+    function classPath(id) {
+      return /databases/$(database)/documents/classes/$(id);
+    }
+    function validCodeKey(c) {
+      return c is string && c.matches('^[A-HJ-NP-Z2-9]{8}$');
+    }
+    // Class details the owner may set. "subject" is optional.
+    function validClassData(d) {
+      return d.name is string && d.name.size() >= 3 && d.name.size() <= 80
+        && d.course is string && d.course.size() >= 1 && d.course.size() <= 60
+        && d.department is string && d.department.size() >= 1 && d.department.size() <= 60
+        && d.academicYear is string && d.academicYear.matches('^[0-9]{4}-[0-9]{2}$')
+        && d.semester is int && d.semester >= 1 && d.semester <= 12
+        && d.section is string && d.section.size() >= 1 && d.section.size() <= 10
+        && (!('subject' in d) || (d.subject is string && d.subject.size() <= 80))
+        && d.status in ['active', 'archived'];
+    }
+    function validSalt(d) {
+      return d.salt is string && d.salt.matches('^[0-9a-f]{32}$')
+        && d.iter is int && d.iter >= 100000 && d.iter <= 1000000;
+    }
+
     // Each user can read and maintain only their own profile.
     match /users/{uid} {
       allow read: if isOwner(uid);
@@ -43,6 +72,74 @@ service cloud.firestore {
     match /roles/{uid} {
       allow read: if isOwner(uid);
       allow write: if false;
+    }
+
+    // ---- Classes -------------------------------------------------------------
+    // Only faculty create classes, only the owner reads or edits them, and nothing is ever deleted
+    // (classes are archived instead). ownerUid, codeKey and createdAt can never change.
+    // A class is created together with its code and secret in ONE batched write; the checks
+    // below (getAfter / existsAfter) reject a class that is missing either of them.
+    match /classes/{classId} {
+      allow read: if isFaculty() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isFaculty()
+        && request.resource.data.keys().hasOnly(['ownerUid', 'name', 'course', 'department', 'academicYear',
+             'semester', 'section', 'subject', 'status', 'codeKey', 'createdAt', 'updatedAt'])
+        && request.resource.data.keys().hasAll(['ownerUid', 'name', 'course', 'department', 'academicYear',
+             'semester', 'section', 'status', 'codeKey', 'createdAt', 'updatedAt'])
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.status == 'active'
+        && validClassData(request.resource.data)
+        && validCodeKey(request.resource.data.codeKey)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && getAfter(/databases/$(database)/documents/classCodes/$(request.resource.data.codeKey)).data.classId == classId
+        && existsAfter(/databases/$(database)/documents/classSecrets/$(classId));
+      allow update: if isFaculty()
+        && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['name', 'course', 'department', 'academicYear', 'semester', 'section', 'subject', 'status', 'updatedAt'])
+        && validClassData(request.resource.data)
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // Public lookup used by a student who types a class code. It holds NO secret: only the class id
+    // and the random salt the student's browser needs to hash the password. One document can be
+    // fetched by its exact code; listing or searching is not allowed.
+    match /classCodes/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if isFaculty()
+        && validCodeKey(code)
+        && request.resource.data.keys().hasOnly(['classId', 'salt', 'iter'])
+        && request.resource.data.keys().hasAll(['classId', 'salt', 'iter'])
+        && request.resource.data.classId is string
+        && validSalt(request.resource.data)
+        && getAfter(classPath(request.resource.data.classId)).data.ownerUid == request.auth.uid
+        && getAfter(classPath(request.resource.data.classId)).data.codeKey == code;
+      // Used when the owner resets the enrollment password (a new salt).
+      allow update: if isFaculty()
+        && get(classPath(resource.data.classId)).data.ownerUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['salt', 'iter'])
+        && validSalt(request.resource.data);
+      allow delete: if false;
+    }
+
+    // Stores only a PBKDF2 hash of the enrollment password (never the password itself).
+    // No browser can read it. The owner can create it with the class and replace it on reset.
+    match /classSecrets/{classId} {
+      allow read: if false;
+      allow create: if isFaculty()
+        && request.resource.data.keys().hasOnly(['verifier'])
+        && request.resource.data.verifier is string
+        && request.resource.data.verifier.matches('^[0-9a-f]{64}$')
+        && getAfter(classPath(classId)).data.ownerUid == request.auth.uid;
+      allow update: if isFaculty()
+        && request.resource.data.keys().hasOnly(['verifier'])
+        && request.resource.data.verifier is string
+        && request.resource.data.verifier.matches('^[0-9a-f]{64}$')
+        && get(classPath(classId)).data.ownerUid == request.auth.uid;
+      allow delete: if false;
     }
 
     // Everything else: denied.
