@@ -333,7 +333,16 @@ async function fetchClasses() {
     State.classes = list; State.cls = { status: 'ready', error: null };
   } catch (e) {
     if (!State.auth.user || State.auth.user.uid !== uid) return;
-    State.cls = { status: 'error', error: e.message };
+    let msg = e.message;
+    // A refusal is either "new rules not published" or "roles document is not exactly right". Show what the roles document holds.
+    if (e && e.code === 'permission-denied') {
+      const d = await withTimeout(B.inspectRoles(uid), 6000, null);
+      if (!State.auth.user || State.auth.user.uid !== uid) return;
+      if (d) msg += d.exists
+        ? ` What your roles document holds right now: field "roles" is of type ${d.type}, value ${d.valueText || '(empty)'}. It must be type array with value ["faculty"]. If it already is, the new rules are not published yet.`
+        : ` There is no document at roles/${uid}.`;
+    }
+    State.cls = { status: 'error', error: msg };
   }
   refresh();
 }
