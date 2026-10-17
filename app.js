@@ -80,6 +80,8 @@ function renderRoute() {
     // UX guard only. Real protection is Firestore rules + server checks (later stages).
     if (!NAV[p[1]] || !allowedRoles().includes(p[1])) { app.innerHTML = deniedView(p[1]); return; }
     setView(p[1], p[2]);
+    State.classOpen = (p[1] === 'faculty' && p[2] === 'classes' && p[3]) ? p[3] : null;
+    if (p[1] === 'faculty') ensureClasses();
     app.innerHTML = shell(currentView());
     return;
   }
@@ -118,6 +120,9 @@ const authReady = new Promise(r => { resolveAuthReady = r; });
 
 async function onUser(user, err) {
   const seq = ++authSeq;
+  // Never show one account's classes to another: clear everything on every sign-in / sign-out.
+  // (Demo mode keeps its own sample classes; leaving demo reloads empty data anyway.)
+  if (!State.demo) { State.classes = []; State.cls = { status: 'idle', error: null }; State.classOpen = null; }
   if (!user) {
     State.auth = { status: 'signedOut', user: null, roles: [], warning: null, error: err ? err.message : null };
     if (err) State.authError = err.message;
@@ -315,10 +320,135 @@ function importDialog() {
   });
 }
 
+/* ---------- Phase 3: classes (real mode) ---------- */
+let modalLocked = false, opBusy = false;
+
+/* Loads the signed-in faculty member's classes. Quiet: it does not blank the page. */
+async function fetchClasses() {
+  const uid = State.auth.user && State.auth.user.uid;
+  if (!uid || !B) return;
+  try {
+    const list = await B.listClasses();
+    if (!State.auth.user || State.auth.user.uid !== uid) return; // signed out or switched account meanwhile
+    State.classes = list; State.cls = { status: 'ready', error: null };
+  } catch (e) {
+    if (!State.auth.user || State.auth.user.uid !== uid) return;
+    State.cls = { status: 'error', error: e.message };
+  }
+  refresh();
+}
+function ensureClasses() {
+  if (State.demo || State.cls.status !== 'idle') return;
+  State.cls = { status: 'loading', error: null };
+  fetchClasses();
+}
+
+function setModalBusy(on, label) {
+  const b = $('[data-modal-btn="1"]'); if (!b) return;
+  if (on) { b.dataset.label = b.textContent; b.disabled = true; if (label) b.textContent = label; }
+  else { b.disabled = false; if (b.dataset.label) b.textContent = b.dataset.label; }
+}
+function showFormErr(msg) { const el = $('#f-formerr'); if (el) el.innerHTML = '<div class="notice bad" role="alert" style="margin-bottom:12px">' + plainEsc(msg) + '</div>'; }
+
+/* Runs an async step from a dialog button: blocks double-taps, shows errors inside the dialog. */
+async function runDialog(run, done, busyLabel) {
+  if (opBusy) return;
+  opBusy = true; setModalBusy(true, busyLabel); showFormErr('');
+  try { const r = await run(); closeModal(); if (done) await done(r); }
+  catch (e) { showFormErr(e && e.message ? e.message : 'Something went wrong. Please try again.'); setModalBusy(false); }
+  finally { opBusy = false; }
+}
+
+/* Shown once after a class is created or its password is reset. The dialog cannot be dismissed by accident. */
+function secretDialog(o) {
+  modalLocked = true;
+  const big = 'font-family:ui-monospace,Menlo,Consolas,monospace;font-size:1.3rem;letter-spacing:.1em;font-weight:700;word-break:break-all;margin-top:4px';
+  openModal({
+    title: o.title,
+    body: (o.name ? `<p class="muted small" style="margin-bottom:12px">${esc(o.name)}</p>` : '') +
+      (o.code ? `<div class="muted small">Join code</div><div style="${big}">${esc(codeFmt(o.code))}</div>` : '') +
+      `<div class="muted small" style="margin-top:12px">Enrollment password</div><div style="${big}" id="secret-pass">${esc(o.password)}</div>
+      <div class="row wrap" style="margin-top:12px"><button class="btn btn-ghost btn-sm" data-action="copy-text" data-text="${esc(o.password)}" data-what="Password">Copy password</button>${o.code ? `<button class="btn btn-ghost btn-sm" data-action="copy-text" data-text="${esc(o.code)}" data-what="Join code">Copy code</button>` : ''}</div>
+      <div class="notice" style="margin-top:14px"><b>Save this password now.</b> It is not stored anywhere and will not be shown again. If you lose it, use Reset password to make a new one.</div>`,
+    actions: [{ label: 'I have saved it', cls: 'btn-primary', onClick() { modalLocked = false; } }]
+  });
+}
+
+const ACADEMIC_YEAR = /^(\d{4})-(\d{2})$/;
+function readClassForm() {
+  const clean = id => val(id).replace(/\s+/g, ' ');
+  const f = { name: clean('f-name'), course: clean('f-course'), department: clean('f-dept'), academicYear: clean('f-year'), semester: parseInt(val('f-sem'), 10), section: clean('f-sec'), subject: clean('f-subj') };
+  const ym = ACADEMIC_YEAR.exec(f.academicYear);
+  let bad = false;
+  bad = setErr('f-name', f.name.length < 3 || f.name.length > 80 ? 'Enter a class name (3 to 80 characters).' : '') || bad;
+  bad = setErr('f-course', !f.course || f.course.length > 60 ? 'Enter the course (up to 60 characters).' : '') || bad;
+  bad = setErr('f-dept', !f.department || f.department.length > 60 ? 'Enter the department (up to 60 characters).' : '') || bad;
+  bad = setErr('f-year', !ym || (+ym[1] + 1) % 100 !== +ym[2] ? 'Use the form 2025-26.' : '') || bad;
+  bad = setErr('f-sem', !(f.semester >= 1 && f.semester <= 12) ? 'Choose a semester from 1 to 12.' : '') || bad;
+  bad = setErr('f-sec', !f.section || f.section.length > 10 ? 'Enter a section (up to 10 characters).' : '') || bad;
+  bad = setErr('f-subj', f.subject.length > 80 ? 'Subject can be up to 80 characters.' : '') || bad;
+  return bad ? null : f;
+}
+
+function classFormDialog(existing) {
+  const e = existing || {};
+  const sem = Array.from({ length: 12 }, (_, i) => `<option value="${i + 1}" ${Number(e.semester) === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('');
+  const txt = (id, max, v, ph, extra = '') => inputHtml(id, `maxlength="${max}" value="${esc(v || '')}" placeholder="${ph}" autocomplete="off" ${extra}`);
+  openModal({
+    title: existing ? 'Edit class' : 'New class',
+    body: '<div id="f-formerr"></div>' +
+      field('f-name', 'Class name', txt('f-name', 80, e.name, 'e.g. BCA Cybersecurity – Sem 1')) +
+      field('f-course', 'Course', txt('f-course', 60, e.course, 'e.g. BCA')) +
+      field('f-dept', 'Department', txt('f-dept', 60, e.department, 'e.g. Computer Science')) +
+      field('f-year', 'Academic year', txt('f-year', 7, e.academicYear, '2025-26', 'inputmode="numeric"')) +
+      field('f-sem', 'Semester', `<select class="input" id="f-sem">${sem}</select>`) +
+      field('f-sec', 'Section', txt('f-sec', 10, e.section, 'e.g. A')) +
+      field('f-subj', 'Subject (optional)', txt('f-subj', 80, e.subject, 'Leave blank for a whole-class register')) +
+      (existing ? '' : '<div class="notice info">A join code and a random enrollment password are created for you. The password is shown once and is never stored.</div>'),
+    actions: [{ label: 'Cancel' }, {
+      label: existing ? 'Save' : 'Create class', cls: 'btn-primary',
+      onClick() {
+        const f = readClassForm(); if (!f) return false;
+        if (existing) runDialog(() => B.updateClass(existing.id, f), async () => { toast('Class updated.'); await fetchClasses(); }, 'Saving…');
+        else runDialog(() => B.createClass(f), async r => { secretDialog({ title: 'Class created', name: f.name, code: r.code, password: r.password }); await fetchClasses(); }, 'Creating…');
+        return false;
+      }
+    }]
+  });
+}
+
+function archiveClassDialog(c) {
+  openModal({
+    title: 'Archive this class?',
+    body: `<div id="f-formerr"></div><p class="muted">“${esc(c.name)}” will move to the Archived list. Nothing is deleted, and you can restore it at any time.</p>`,
+    actions: [{ label: 'Cancel' }, {
+      label: 'Archive', cls: 'btn-danger',
+      onClick() { runDialog(() => B.setClassStatus(c.id, 'archived'), async () => { toast('Class archived.', 'info'); await fetchClasses(); }, 'Archiving…'); return false; }
+    }]
+  });
+}
+async function restoreClass(c) {
+  if (opBusy) return; opBusy = true;
+  try { await B.setClassStatus(c.id, 'active'); toast('Class restored.'); await fetchClasses(); }
+  catch (e) { toast(e.message, 'err'); }
+  finally { opBusy = false; }
+}
+function resetPassDialog(c) {
+  openModal({
+    title: 'Reset enrollment password?',
+    body: `<div id="f-formerr"></div><p class="muted">A new random password will be created for “${esc(c.name)}”. The old password stops working for new join requests. Students who are already enrolled are not affected.</p>`,
+    actions: [{ label: 'Cancel' }, {
+      label: 'Reset password', cls: 'btn-primary',
+      onClick() { runDialog(() => B.resetClassPassword(c.id, c.codeKey), r => secretDialog({ title: 'New password', name: c.name, password: r.password }), 'Resetting…'); return false; }
+    }]
+  });
+}
+const classById = id => State.classes.find(c => c.id === id);
+
 /* ---------- click actions ---------- */
 /* Features that are not built yet. In real mode they say so instead of pretending to save. */
 const STAGE_FOR = {
-  'join-approve': 3, 'join-reject': 3, 'new-class': 3, 'edit-class': 3, 'archive-class': 3, 'restore-class': 3, 'join-class': 3,
+  'join-approve': 3, 'join-reject': 3, 'join-class': 3,
   'add-student': 4, import: 4, 'delete-selected': 4,
   mark: 5, 'mark-all': 5, finalize: 5, pdf: 6,
   'req-approve': 7, 'req-reject': 7, 'new-request': 7,
@@ -335,14 +465,27 @@ const Actions = {
   },
   logout: doSignOut,
   'toggle-notif': () => { State.notifOpen = !State.notifOpen; refresh(); },
-  'modal-backdrop': (el, e) => { if (e.target === el) closeModal(); },
+  'modal-backdrop': (el, e) => { if (e.target === el && !modalLocked) closeModal(); },
+  'copy-text': async el => {
+    try { await navigator.clipboard.writeText(el.dataset.text); toast((el.dataset.what || 'Text') + ' copied.'); }
+    catch (e) { toast('Could not copy. Press and hold the text to select it.', 'err'); }
+  },
+  'open-class': el => { location.hash = `${base()}faculty/classes/${el.dataset.id}`; },
+  'reload-classes': () => { State.cls = { status: 'loading', error: null }; refresh(); fetchClasses(); },
+  'reset-pass': el => { const c = classById(el.dataset.id); if (c) resetPassDialog(c); },
   'join-approve': el => { State.joinRequests.find(j => j.id === el.dataset.id).status = 'Approved'; toast('Join request approved (demo only).'); refresh(); },
   'join-reject': el => { State.joinRequests.find(j => j.id === el.dataset.id).status = 'Rejected'; toast('Join request rejected (demo only).', 'info'); refresh(); },
   'new-announcement': announceDialog,
-  'new-class': () => newClassDialog(),
-  'edit-class': el => newClassDialog(State.classes.find(c => c.id === el.dataset.id)),
-  'archive-class': el => { State.classes.find(c => c.id === el.dataset.id).archived = true; toast('Class archived (demo only).', 'info'); refresh(); },
-  'restore-class': el => { State.classes.find(c => c.id === el.dataset.id).archived = false; toast('Class restored.'); refresh(); },
+  'new-class': () => State.demo ? newClassDialog() : classFormDialog(null),
+  'edit-class': el => { const c = classById(el.dataset.id); if (!c) return; State.demo ? newClassDialog(c) : classFormDialog(c); },
+  'archive-class': el => {
+    const c = classById(el.dataset.id); if (!c) return;
+    if (State.demo) { c.archived = true; toast('Class archived (demo only).', 'info'); refresh(); } else archiveClassDialog(c);
+  },
+  'restore-class': el => {
+    const c = classById(el.dataset.id); if (!c) return;
+    if (State.demo) { c.archived = false; toast('Class restored.'); refresh(); } else restoreClass(c);
+  },
   'join-class': joinClassDialog,
   mark: el => { const m = State.att.marks; m[el.dataset.id] = m[el.dataset.id] === el.dataset.v ? undefined : el.dataset.v; refresh(); },
   'mark-all': () => { State.roster.forEach(s => State.att.marks[s.id] = 'P'); refresh(); },
@@ -387,7 +530,7 @@ document.addEventListener('submit', e => {
   State.messages.push({ who: me().name, me: true, text, time: pad2(now.getHours()) + ':' + pad2(now.getMinutes()) });
   refresh(); const i = $('input[name=msg]'); if (i) i.focus();
 });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !modalLocked) closeModal(); });
 
 /* ---------- start ---------- */
 /* Rules: (1) the splash never stays longer than 7 seconds, whatever Firebase does;
