@@ -14,7 +14,9 @@ const State = {
   announcements: [], messages: [], room: null, history: [],
   att: { classId: null, marks: {}, sessionNo: 1, lastSummary: null },
   // Phase 3: real classes for the signed-in faculty. status: 'idle' | 'loading' | 'ready' | 'error'
-  cls: { status: 'idle', error: null }, classOpen: null
+  cls: { status: 'idle', error: null }, classOpen: null,
+  // Phase 3b: faculty's pending requests (jr), a student's own requests (myJ), members per class id
+  jr: { status: 'idle', error: null }, myJ: { status: 'idle', error: null }, members: {}
 };
 
 /* Where on-screen data comes from: sample data in demo mode, nothing in real mode. */
@@ -26,6 +28,7 @@ function loadData(demo) {
   State.room = demo ? 'm1' : null;
   State.att = { classId: demo ? 'c1' : null, marks: {}, sessionNo: 1, lastSummary: null };
   State.cls = { status: 'idle', error: null }; State.classOpen = null;
+  State.jr = { status: 'idle', error: null }; State.myJ = { status: 'idle', error: null }; State.members = {};
 }
 loadData(false);
 
@@ -200,10 +203,16 @@ const allSessions = () => [...State.history, ...D().sessions];
 
 const announcementList = () => State.announcements.length ? `<div class="list">${State.announcements.map(a => `<div class="item"><div class="grow"><b>${esc(a.title)}</b><div class="muted small">${esc(a.body)}</div></div><span class="chip">${esc(a.when)}</span></div>`).join('')}</div>` : emptyState('mega', 'No announcements', 'Nothing has been posted yet.');
 
-const joinRequestList = (canAct) => {
-  if (!State.joinRequests.length) return emptyState('inbox', 'No join requests', 'New requests will show up here.');
-  return `<div class="list">${State.joinRequests.map(j => `<div class="item"><div class="grow"><b>${esc(j.student)}</b><div class="muted small">${esc(j.cls)} · ${j.when}</div></div>
-    ${j.status === 'Pending' && canAct ? `<div class="actions"><button class="btn btn-ok btn-sm" data-action="join-approve" data-id="${j.id}">Approve</button><button class="btn btn-danger btn-sm" data-action="join-reject" data-id="${j.id}">Reject</button></div>` : `<span class="chip ${chipFor(j.status)}">${j.status}</span>`}</div>`).join('')}</div>`;
+const loadErr = (k, what) => `<div class="notice bad" role="alert"><b>Could not load ${what}.</b> ${esc(k.error || '')}</div><div style="margin-top:12px"><button class="btn btn-primary btn-sm" data-action="reload-requests">Try again</button></div>`;
+const reqItem = (j, canAct) => `<div class="item"><div class="row grow" style="gap:10px;min-width:0">${State.demo ? '' : avatar({ name: j.student, photo: j.photoURL }, 36)}<div class="grow" style="min-width:0"><b>${esc(j.student)}</b><div class="muted small" style="word-break:break-word">${j.email ? esc(j.email) + ' · ' : ''}${esc(j.cls)} · ${esc(j.when)}</div></div></div>
+    ${j.status === 'Pending' && canAct ? `<div class="actions"><button class="btn btn-ok btn-sm" data-action="join-approve" data-id="${esc(j.id)}">Approve</button><button class="btn btn-danger btn-sm" data-action="join-reject" data-id="${esc(j.id)}">Reject</button></div>` : `<span class="chip ${chipFor(j.status)}">${esc(j.status)}</span>`}</div>`;
+const joinRequestList = (canAct, list = State.joinRequests) => {
+  if (!State.demo) {
+    if (State.jr.status === 'idle' || State.jr.status === 'loading') return skeletons();
+    if (State.jr.status === 'error') return loadErr(State.jr, 'join requests');
+  }
+  if (!list.length) return emptyState('inbox', 'No join requests', 'New requests will show up here.');
+  return `<div class="list">${list.map(j => reqItem(j, canAct)).join('')}</div>`;
 };
 const attendanceDonuts = () => D().myAttendance.length ? `<div class="grid g3">${D().myAttendance.map(a => { const p = Math.round(a.attended * 100 / a.total); return `<div class="row">${donut(p, 84)}<div><b class="small">${esc(a.cls)}</b><div class="muted small">${a.attended} of ${a.total} sessions</div>${p < 75 ? '<span class="chip bad">Below 75%</span>' : '<span class="chip ok">On track</span>'}</div></div>`; }).join('')}</div>` : emptyState('chart', 'No attendance yet', 'Your attendance appears here once you are in a class and sessions are recorded.');
 const weeklyChart = () => D().weekly.length ? barChart(D().weekly, D().weeklyLabels) : emptyState('chart', 'No attendance data yet', 'Charts appear after attendance is recorded.');
@@ -252,7 +261,16 @@ function classCard(c) {
     <div class="row wrap" style="margin-top:14px"><button class="btn btn-primary btn-sm" data-action="open-class" data-id="${esc(c.id)}">Open</button><button class="btn btn-ghost btn-sm" data-action="edit-class" data-id="${esc(c.id)}">Edit</button><button class="btn btn-danger btn-sm" data-action="archive-class" data-id="${esc(c.id)}">Archive</button></div></div>`;
 }
 
+function memberList(c, m) {
+  if (m.status === 'loading') return skeletons();
+  if (m.status === 'error') return loadErr(m, 'the enrolled students');
+  if (!m.list.length) return emptyState('users', 'No students yet', 'Students appear here after you approve their join requests. Adding students by hand and importing a file come in the next step.');
+  return `<div class="list">${m.list.map(x => `<div class="item"><div class="row grow" style="gap:10px;min-width:0">${avatar({ name: x.name, photo: x.photoURL }, 36)}<div class="grow" style="min-width:0"><b>${esc(x.name)}</b><div class="muted small" style="word-break:break-word">${esc(x.email)}${x.joined ? ' · joined ' + esc(x.joined) : ''}</div></div></div></div>`).join('')}</div>`;
+}
+
 function classDashboard(c) {
+  const members = State.members[c.id] || { status: 'loading', list: [] };
+  const pending = State.joinRequests.filter(j => j.classId === c.id);
   const info = (l, v) => `<div><div class="muted small">${l}</div><b>${v ? esc(v) : '—'}</b></div>`;
   return `<div style="margin-bottom:12px"><a class="btn btn-ghost btn-sm" href="#/app/faculty/classes">← All classes</a></div>
   <div class="card"><div class="row between wrap"><div><h3 style="margin:0">${esc(c.name)}</h3><div class="muted small" style="margin-top:4px">${esc(classTag(c))}</div></div>
@@ -266,11 +284,21 @@ function classDashboard(c) {
     <div class="row wrap"><button class="btn btn-ghost btn-sm" data-action="copy-text" data-text="${esc(c.codeKey)}" data-what="Join code">${icon('file')} Copy code</button>
       <button class="btn btn-ghost btn-sm" data-action="reset-pass" data-id="${esc(c.id)}">${icon('lock')} Reset password</button></div>
     <p class="muted small" style="margin-top:12px">The enrollment password is never stored or shown again after it is created. If you lose it, reset it to get a new one.</p></div>
-  <div class="grid g4 stats-row">${stat('users', 0, 'Enrolled students')}${stat('inbox', 0, 'Pending join requests')}</div>
+  <div class="grid g4 stats-row">${stat('users', members.status === 'ready' ? members.list.length : '…', 'Enrolled students')}${stat('inbox', State.jr.status === 'ready' ? pending.length : '…', 'Pending join requests')}</div>
   <div class="grid g2">
-    <div class="card"><h3>Enrolled students</h3>${emptyState('users', 'No students yet', 'Students will appear here once they join or you add them. Roster tools are the next step.')}</div>
-    <div class="card"><h3>Pending join requests</h3>${emptyState('inbox', 'No join requests', 'Student join requests are the next step. Nobody can request to join yet.')}</div>
+    <div class="card"><h3>Enrolled students</h3>${memberList(c, members)}</div>
+    <div class="card"><h3>Pending join requests</h3>${joinRequestList(true, pending)}</div>
   </div>`;
+}
+
+function studentClassesReal() {
+  const k = State.myJ;
+  const head = `<div class="row between wrap"><p class="muted">Ask to join a class with its code and password. The faculty member approves each request.</p><button class="btn btn-primary btn-sm" data-action="join-class">${icon('plus')} Join a class</button></div>`;
+  if (k.status === 'idle' || k.status === 'loading') return banner() + head + skeletons();
+  if (k.status === 'error') return banner() + loadErr(k, 'your classes');
+  const rows = State.myJoin.map(j => `<div class="item"><div class="grow"><b>${esc(j.cls)}</b><div class="muted small">${j.status === 'Approved' ? 'You are enrolled' : j.status === 'Pending' ? 'Waiting for approval' : 'The request was not approved'} · requested ${esc(j.when)}</div></div>
+    <span class="chip ${chipFor(j.status)}">${esc(j.status)}</span>${j.status === 'Approved' ? '' : `<button class="btn btn-ghost btn-sm" data-action="cancel-join" data-id="${esc(j.id)}">${j.status === 'Pending' ? 'Cancel' : 'Remove'}</button>`}</div>`).join('');
+  return `${banner()}${head}<div class="card"><h3>My classes and join requests</h3><div class="list">${rows || emptyState('book', 'No classes yet', 'Tap Join a class and enter the code and password from your faculty member.')}</div></div>`;
 }
 
 function facultyClassesReal() {
@@ -291,6 +319,7 @@ function facultyClassesReal() {
 V.classes = () => {
   if (!State.demo && State.role === 'faculty') return facultyClassesReal();
   if (State.role === 'student') {
+    if (!State.demo) return studentClassesReal();
     const rows = State.myJoin.map(j => `<div class="item"><div class="grow"><b>${esc(j.cls)}</b><div class="muted small">Requested ${j.when}</div></div><span class="chip ${chipFor(j.status)}">${j.status}</span></div>`).join('');
     return `${banner(3)}<div class="card"><div class="row between wrap"><h3>My classes and join requests</h3><button class="btn btn-primary btn-sm" data-action="join-class">${icon('plus')} Join a class</button></div><div class="list">${rows || emptyState('book', 'No classes yet', 'Use a six-digit code and the class password to request access.')}</div></div>`;
   }
