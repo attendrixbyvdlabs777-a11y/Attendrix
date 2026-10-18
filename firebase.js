@@ -311,7 +311,7 @@
   const normCode = c => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   const appErr = (msg, code) => { const e = new Error(msg); e.code = code || 'app/invalid'; return e; };
   const dateText = ts => { try { return ts && ts.toDate ? ts.toDate().toISOString().slice(0, 10) : ''; } catch (e) { return ''; } };
-  const STATUS_TEXT = { pending: 'Pending', approved: 'Approved', rejected: 'Rejected' };
+  const STATUS_TEXT = { pending: 'Pending', approved: 'Approved', rejected: 'Rejected', removed: 'Removed' };
   function joinErr(e) {
     if (e && e.code === 'permission-denied') {
       const err = new Error('Firestore refused this. Check that the latest firestore.rules is published in the Firebase console.');
@@ -361,6 +361,9 @@
       const { db, fsM } = fb, uid = meUid();
       const snap = await fsM.getDocs(fsM.query(fsM.collection(db, 'joinRequests'), fsM.where('studentUid', '==', uid)));
       const out = []; snap.forEach(d => out.push(toRequest(d.id, d.data())));
+      for (const r of out) if (r.raw === 'approved') {
+        try { const m = await fsM.getDoc(fsM.doc(db, 'classes', r.classId, 'members', uid)); if (m.exists() && m.data().removed === true) r.status = 'Removed'; } catch (e) { /* keep Approved */ }
+      }
       return out.sort((a, b) => b.when.localeCompare(a.when));
     } catch (e) { throw joinErr(e); }
   }
@@ -376,12 +379,45 @@
       return out.sort((a, b) => a.when.localeCompare(b.when));
     } catch (e) { throw joinErr(e); }
   }
+  /* Roster = joined students (members) + students added by hand. Removed ones come back flagged. */
   async function listMembers(classId) {
     try {
       const { db, fsM } = fb; meUid();
-      const snap = await fsM.getDocs(fsM.collection(db, 'classes', classId, 'members'));
-      const out = []; snap.forEach(d => { const x = d.data(); out.push({ uid: d.id, name: x.displayName || x.email || '', email: x.email || '', photoURL: x.photoURL || null, joined: dateText(x.joinedAt) }); });
-      return out.sort((a, b) => a.name.localeCompare(b.name));
+      const [a, b] = await Promise.all([fsM.getDocs(fsM.collection(db, 'classes', classId, 'members')), fsM.getDocs(fsM.collection(db, 'classes', classId, 'students'))]);
+      const out = [];
+      a.forEach(d => { const x = d.data(); out.push({ kind: 'member', id: d.id, uid: d.id, name: x.displayName || x.email || '', email: x.email || '', photoURL: x.photoURL || null, joined: dateText(x.joinedAt), removed: x.removed === true }); });
+      b.forEach(d => { const x = d.data(); out.push({ kind: 'manual', id: d.id, uid: null, name: x.name || '', email: x.email || '', photoURL: null, joined: dateText(x.createdAt), removed: x.removed === true }); });
+      return out.sort((p, q) => p.name.localeCompare(q.name, undefined, { sensitivity: 'base' }) || p.id.localeCompare(q.id));
+    } catch (e) { throw joinErr(e); }
+  }
+  const cleanName = n => String(n || '').replace(/\s+/g, ' ').trim();
+  const cleanEmail = n => String(n || '').trim();
+  function checkStudent(name, email) {
+    if (!name) throw appErr('The name cannot be blank.');
+    if (name.length > 120) throw appErr('The name is too long (120 characters at most).');
+    if (email.length > 200 || (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) throw appErr('That email address does not look right. Leave it empty if you do not have one.');
+  }
+  async function addStudent(classId, nameRaw, emailRaw) {
+    try {
+      const { db, fsM } = fb; meUid();
+      const name = cleanName(nameRaw), email = cleanEmail(emailRaw); checkStudent(name, email);
+      await fsM.addDoc(fsM.collection(db, 'classes', classId, 'students'), { name, email, removed: false, createdAt: fsM.serverTimestamp() });
+    } catch (e) { throw joinErr(e); }
+  }
+  /* Edit the name/email of a hand-added student. Joined students' details come from their own account and stay as they sent them. */
+  async function updateStudent(classId, id, nameRaw, emailRaw) {
+    try {
+      const { db, fsM } = fb; meUid();
+      const name = cleanName(nameRaw), email = cleanEmail(emailRaw); checkStudent(name, email);
+      await fsM.updateDoc(fsM.doc(db, 'classes', classId, 'students', id), { name, email });
+    } catch (e) { throw joinErr(e); }
+  }
+  /* Soft remove / restore. Nothing is deleted. */
+  async function setStudentRemoved(classId, x, removed) {
+    try {
+      const { db, fsM } = fb; meUid();
+      const ref = fsM.doc(db, 'classes', classId, x.kind === 'member' ? 'members' : 'students', x.id);
+      await fsM.updateDoc(ref, { removed: !!removed, removedAt: fsM.serverTimestamp() });
     } catch (e) { throw joinErr(e); }
   }
   /* Faculty: approve or reject. Approving writes the request update AND the member document in one batch. */
@@ -405,5 +441,5 @@
 
   window.AttendrixBackend = { init, onAuth, signIn, signOut, syncProfile, loadRoles, inspectRoles, isConfigured, probeRules,
     listClasses, createClass, updateClass, setClassStatus, resetClassPassword,
-    requestJoin, listMyRequests, cancelRequest, listPendingRequests, listMembers, decideRequest, _derive: derive, _newSecret: newSecret };
+    requestJoin, listMyRequests, cancelRequest, listPendingRequests, listMembers, addStudent, updateStudent, setStudentRemoved, decideRequest, _derive: derive, _newSecret: newSecret };
 })();
