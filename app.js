@@ -325,8 +325,52 @@ function importDialog() {
   });
 }
 
+
+/* ---------- Phase 3c: roster (real mode) ---------- */
+function rosterEntry(cid, id, kind) { const m = State.members[cid]; return m && m.list.find(x => x.id === id && (!kind || x.kind === kind)); }
+function studentFormDialog(cid, existing) {
+  openModal({
+    title: existing ? 'Edit student' : 'Add student',
+    body: '<div id="f-formerr"></div>' +
+      field('f-sname', 'Student name', inputHtml('f-sname', 'maxlength="120" autocomplete="off" value="' + plainEsc(existing ? existing.name : '') + '"')) +
+      field('f-semail', 'Email (optional)', inputHtml('f-semail', 'maxlength="200" autocomplete="off" inputmode="email" value="' + plainEsc(existing ? existing.email : '') + '"')) +
+      '<div class="notice info">The roll number is given automatically, in name order.</div>',
+    actions: [{ label: 'Cancel' }, {
+      label: existing ? 'Save' : 'Add', cls: 'btn-primary',
+      onClick() {
+        const n = val('f-sname').replace(/\s+/g, ' '), em = val('f-semail');
+        const list = (State.members[cid] ? State.members[cid].list : []);
+        let bad = setErr('f-sname', !n ? 'Name cannot be blank.' : list.some(x => !x.removed && x.id !== (existing && existing.id) && x.name.toLowerCase() === n.toLowerCase()) ? 'A student with this name is already in the roster. Add something to tell them apart, like an initial.' : '');
+        bad = setErr('f-semail', em && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em) ? 'This email does not look right.' : '') || bad;
+        if (bad) return false;
+        runDialog(() => existing ? B.updateStudent(cid, existing.id, n, em) : B.addStudent(cid, n, em),
+          async () => { toast(existing ? 'Student updated.' : 'Student added.', 'ok'); await fetchMembers(cid); }, 'Saving…');
+        return false;
+      }
+    }]
+  });
+}
+function removeStudentDialog(cid, x) {
+  openModal({
+    title: 'Remove ' + x.name + '?',
+    body: '<div id="f-formerr"></div><p class="muted">They leave the roster and the roll numbers close up. Nothing is deleted: their record stays, and you can restore them later.</p>',
+    actions: [{ label: 'Keep' }, {
+      label: 'Remove', cls: 'btn-danger',
+      onClick() { runDialog(() => B.setStudentRemoved(cid, x, true), async () => { toast('Student removed. You can restore them.', 'info'); await fetchMembers(cid); }, 'Removing…'); return false; }
+    }]
+  });
+}
+async function restoreStudentNow(cid, x) {
+  if (opBusy) return; opBusy = true;
+  try {
+    const clash = State.members[cid].list.some(y => !y.removed && y.id !== x.id && y.name.toLowerCase() === x.name.toLowerCase());
+    if (clash && !confirm('Another student with the name "' + x.name + '" is already in the roster. Restore anyway?')) return;
+    await B.setStudentRemoved(cid, x, false); toast('Student restored.', 'ok'); await fetchMembers(cid);
+  } catch (e) { toast(e.message, 'err'); } finally { opBusy = false; }
+}
+
 /* ---------- Phase 3: classes (real mode) ---------- */
-const BUILD = '3b-1';
+const BUILD = '3c-1';
 let modalLocked = false, opBusy = false;
 
 /* Loads the signed-in faculty member's classes. Quiet: it does not blank the page. */
@@ -593,6 +637,11 @@ const Actions = {
     if (State.demo) { State.joinRequests.find(j => j.id === el.dataset.id).status = 'Rejected'; toast('Join request rejected (demo only).', 'info'); return refresh(); }
     const r = State.joinRequests.find(x => x.id === el.dataset.id); if (r) rejectDialog(r);
   },
+  'roster-add': el => studentFormDialog(el.dataset.id),
+  'roster-edit': el => { const x = rosterEntry(el.dataset.cid, el.dataset.id, 'manual'); if (x) studentFormDialog(el.dataset.cid, x); },
+  'roster-remove': el => { const x = rosterEntry(el.dataset.cid, el.dataset.id, el.dataset.kind); if (x) removeStudentDialog(el.dataset.cid, x); },
+  'roster-restore': el => { const x = rosterEntry(el.dataset.cid, el.dataset.id, el.dataset.kind); if (x) restoreStudentNow(el.dataset.cid, x); },
+  'roster-import': () => openModal({ title: 'Import students', body: '<div class="notice">Importing a CSV file, with a preview and checks for blank names and duplicates, is the next step (3d). For now, use Add student.</div>', actions: [{ label: 'Got it', cls: 'btn-primary' }] }),
   'cancel-join': el => { const j = State.myJoin.find(x => x.id === el.dataset.id); if (j) cancelJoinDialog(j); },
   'reload-requests': () => {
     State.jr = { status: 'idle', error: null }; State.myJ = { status: 'idle', error: null }; State.members = {}; refresh();
