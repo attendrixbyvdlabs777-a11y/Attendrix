@@ -261,11 +261,21 @@ function classCard(c) {
     <div class="row wrap" style="margin-top:14px"><button class="btn btn-primary btn-sm" data-action="open-class" data-id="${esc(c.id)}">Open</button><button class="btn btn-ghost btn-sm" data-action="edit-class" data-id="${esc(c.id)}">Edit</button><button class="btn btn-danger btn-sm" data-action="archive-class" data-id="${esc(c.id)}">Archive</button></div></div>`;
 }
 
+/* Roll numbers are derived: active students sorted by name get 1, 2, 3... so they never repeat or leave gaps. */
+function rosterSplit(m) {
+  const active = m.list.filter(x => !x.removed), removed = m.list.filter(x => x.removed);
+  return { active, removed };
+}
 function memberList(c, m) {
   if (m.status === 'loading') return skeletons();
-  if (m.status === 'error') return loadErr(m, 'the enrolled students');
-  if (!m.list.length) return emptyState('users', 'No students yet', 'Students appear here after you approve their join requests. Adding students by hand and importing a file come in the next step.');
-  return `<div class="list">${m.list.map(x => `<div class="item"><div class="row grow" style="gap:10px;min-width:0">${avatar({ name: x.name, photo: x.photoURL }, 36)}<div class="grow" style="min-width:0"><b>${esc(x.name)}</b><div class="muted small" style="word-break:break-word">${esc(x.email)}${x.joined ? ' · joined ' + esc(x.joined) : ''}</div></div></div></div>`).join('')}</div>`;
+  if (m.status === 'error') return loadErr(m, 'the roster');
+  const { active, removed } = rosterSplit(m);
+  const tools = `<div class="row wrap" style="margin-bottom:12px"><button class="btn btn-ghost btn-sm" data-action="roster-import">${icon('upload')} Import CSV</button><button class="btn btn-primary btn-sm" data-action="roster-add" data-id="${esc(c.id)}">${icon('plus')} Add student</button></div>`;
+  const row = (x, i) => `<div class="item"><span class="chip" style="min-width:34px;text-align:center">${i + 1}</span><div class="row grow" style="gap:10px;min-width:0">${avatar({ name: x.name, photo: x.photoURL }, 36)}<div class="grow" style="min-width:0"><b>${esc(x.name)}</b><div class="muted small" style="word-break:break-word">${esc(x.email) || 'No email'}${x.kind === 'member' ? ' · joined with code' : ' · added by hand'}${x.joined ? ' · ' + esc(x.joined) : ''}</div></div></div>
+    <div class="row" style="gap:6px">${x.kind === 'manual' ? `<button class="btn btn-ghost btn-sm" data-action="roster-edit" data-cid="${esc(c.id)}" data-id="${esc(x.id)}">Edit</button>` : ''}<button class="btn btn-danger btn-sm" data-action="roster-remove" data-cid="${esc(c.id)}" data-kind="${x.kind}" data-id="${esc(x.id)}">Remove</button></div></div>`;
+  const list = active.length ? `<div class="list">${active.map(row).join('')}</div>` : emptyState('users', 'No students yet', 'Add students by hand, or approve join requests. Roll numbers are given automatically in name order.');
+  const gone = removed.length ? `<h4 style="margin:18px 0 8px">Removed students (${removed.length})</h4><p class="muted small">Their records are kept. Restore a student to give them a roll number again.</p><div class="list">${removed.map(x => `<div class="item"><div class="grow" style="min-width:0"><b>${esc(x.name)}</b><div class="muted small">${esc(x.email) || 'No email'}</div></div><button class="btn btn-ghost btn-sm" data-action="roster-restore" data-cid="${esc(c.id)}" data-kind="${x.kind}" data-id="${esc(x.id)}">Restore</button></div>`).join('')}</div>` : '';
+  return tools + list + gone;
 }
 
 function classDashboard(c) {
@@ -284,9 +294,9 @@ function classDashboard(c) {
     <div class="row wrap"><button class="btn btn-ghost btn-sm" data-action="copy-text" data-text="${esc(c.codeKey)}" data-what="Join code">${icon('file')} Copy code</button>
       <button class="btn btn-ghost btn-sm" data-action="reset-pass" data-id="${esc(c.id)}">${icon('lock')} Reset password</button></div>
     <p class="muted small" style="margin-top:12px">The enrollment password is never stored or shown again after it is created. If you lose it, reset it to get a new one.</p></div>
-  <div class="grid g4 stats-row">${stat('users', members.status === 'ready' ? members.list.length : '…', 'Enrolled students')}${stat('inbox', State.jr.status === 'ready' ? pending.length : '…', 'Pending join requests')}</div>
+  <div class="grid g4 stats-row">${stat('users', members.status === 'ready' ? rosterSplit(members).active.length : '…', 'Students in roster')}${stat('inbox', State.jr.status === 'ready' ? pending.length : '…', 'Pending join requests')}</div>
   <div class="grid g2">
-    <div class="card"><h3>Enrolled students</h3>${memberList(c, members)}</div>
+    <div class="card"><h3>Roster</h3>${memberList(c, members)}</div>
     <div class="card"><h3>Pending join requests</h3>${joinRequestList(true, pending)}</div>
   </div>`;
 }
@@ -296,8 +306,8 @@ function studentClassesReal() {
   const head = `<div class="row between wrap"><p class="muted">Ask to join a class with its code and password. The faculty member approves each request.</p><button class="btn btn-primary btn-sm" data-action="join-class">${icon('plus')} Join a class</button></div>`;
   if (k.status === 'idle' || k.status === 'loading') return banner() + head + skeletons();
   if (k.status === 'error') return banner() + loadErr(k, 'your classes');
-  const rows = State.myJoin.map(j => `<div class="item"><div class="grow"><b>${esc(j.cls)}</b><div class="muted small">${j.status === 'Approved' ? 'You are enrolled' : j.status === 'Pending' ? 'Waiting for approval' : 'The request was not approved'} · requested ${esc(j.when)}</div></div>
-    <span class="chip ${chipFor(j.status)}">${esc(j.status)}</span>${j.status === 'Approved' ? '' : `<button class="btn btn-ghost btn-sm" data-action="cancel-join" data-id="${esc(j.id)}">${j.status === 'Pending' ? 'Cancel' : 'Remove'}</button>`}</div>`).join('');
+  const rows = State.myJoin.map(j => `<div class="item"><div class="grow"><b>${esc(j.cls)}</b><div class="muted small">${j.status === 'Approved' ? 'You are enrolled' : j.status === 'Removed' ? 'The faculty member removed you from this class' : j.status === 'Pending' ? 'Waiting for approval' : 'The request was not approved'} · requested ${esc(j.when)}</div></div>
+    <span class="chip ${chipFor(j.status)}">${esc(j.status)}</span> ${j.status === 'Approved' || j.status === 'Removed' ? '' : `<button class="btn btn-ghost btn-sm" data-action="cancel-join" data-id="${esc(j.id)}">${j.status === 'Pending' ? 'Cancel' : 'Remove'}</button>`}</div>`).join('');
   return `${banner()}${head}<div class="card"><h3>My classes and join requests</h3><div class="list">${rows || emptyState('book', 'No classes yet', 'Tap Join a class and enter the code and password from your faculty member.')}</div></div>`;
 }
 
