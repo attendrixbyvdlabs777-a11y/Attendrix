@@ -1,6 +1,6 @@
 rules_version = '2';
 
-// ATTENDRIX – Firestore security rules (Phase 3, steps 3a-3b: classes, join requests, members)
+// ATTENDRIX – Firestore security rules (Phase 3, steps 3a-3c: classes, join requests, members, roster)
 // Default is DENY. Only the rules below grant access; everything else stays closed.
 // Later steps add explicit rules for join requests, rosters, attendance, chat, etc.
 //
@@ -231,7 +231,36 @@ service cloud.firestore {
         && request.resource.data.displayName == get(reqPath(classId + '_' + uid)).data.displayName
         && request.resource.data.email == get(reqPath(classId + '_' + uid)).data.email
         && request.resource.data.photoURL == get(reqPath(classId + '_' + uid)).data.photoURL;
-      allow update, delete: if false;
+      // 3c: the owner may only flag a member as removed (or restore them). The record is never deleted.
+      allow update: if isFaculty()
+        && get(classPath(classId)).data.ownerUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['removed', 'removedAt'])
+        && request.resource.data.removed is bool
+        && request.resource.data.removedAt == request.time;
+      allow delete: if false;
+    }
+
+    // ---- Students added by hand (no account yet) --------------------------------
+    // Owner only. Removal is a flag, never a delete, so records stay.
+    match /classes/{classId}/students/{sid} {
+      allow get, list: if isFaculty() && get(classPath(classId)).data.ownerUid == request.auth.uid;
+      allow create: if isFaculty()
+        && get(classPath(classId)).data.ownerUid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['name', 'email', 'removed', 'createdAt'])
+        && request.resource.data.keys().hasAll(['name', 'email', 'removed', 'createdAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1 && request.resource.data.name.size() <= 120
+        && request.resource.data.email is string && request.resource.data.email.size() <= 200
+        && request.resource.data.removed == false
+        && request.resource.data.createdAt == request.time;
+      allow update: if isFaculty()
+        && get(classPath(classId)).data.ownerUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'email', 'removed', 'removedAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1 && request.resource.data.name.size() <= 120
+        && request.resource.data.email is string && request.resource.data.email.size() <= 200
+        && request.resource.data.removed is bool;
+      allow delete: if false;
     }
 
     // Everything else: denied.
