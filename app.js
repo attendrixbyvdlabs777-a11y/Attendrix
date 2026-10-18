@@ -369,8 +369,84 @@ async function restoreStudentNow(cid, x) {
   } catch (e) { toast(e.message, 'err'); } finally { opBusy = false; }
 }
 
+/* ---------- Phase 3d: CSV import (real mode) ---------- */
+/* Small CSV reader: handles quotes, doubled quotes, commas/semicolons/tabs, CRLF and a BOM. */
+function parseCsv(text) {
+  text = String(text).replace(/^\uFEFF/, '');
+  const first = text.split(/\r?\n/, 1)[0];
+  const count = ch => (first.match(new RegExp(ch === '\t' ? '\\t' : '\\' + ch, 'g')) || []).length;
+  const delim = [',', ';', '\t'].sort((a, b) => count(b) - count(a))[0];
+  const rows = []; let row = [], cur = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+    else if (c === '"') q = true;
+    else if (c === delim) { row.push(cur); cur = ''; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cur); rows.push(row); row = []; cur = ''; }
+    else cur += c;
+  }
+  if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+  return rows;
+}
+/* Turns parsed rows into checked rows. existing = names already active in the class. */
+function checkImport(rows, existing) {
+  const out = { problem: '', items: [] };
+  if (!rows.length) { out.problem = 'The file is empty.'; return out; }
+  const head = rows[0].map(h => h.trim().toLowerCase().replace(/[^a-z]/g, ''));
+  const nameCol = head.findIndex(h => ['name', 'studentname', 'fullname', 'student'].includes(h));
+  const mailCol = head.findIndex(h => ['email', 'emailaddress', 'mail', 'emailid'].includes(h));
+  if (nameCol < 0) { out.problem = 'No "Name" column found. The first line of the file must be a header such as: Name,Email'; return out; }
+  if (rows.length - 1 > 1000) { out.problem = 'The file has more than 1000 students. Split it into smaller files.'; return out; }
+  const seen = new Set(existing.map(n => n.toLowerCase()));
+  rows.slice(1).forEach((r, i) => {
+    if (r.every(c => !String(c).trim())) return; // fully empty line: ignore
+    const name = String(r[nameCol] || '').replace(/\s+/g, ' ').trim(), email = mailCol >= 0 ? String(r[mailCol] || '').trim() : '';
+    let err = '';
+    if (!name) err = 'Blank name';
+    else if (name.length > 120) err = 'Name too long';
+    else if (email && (email.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) err = 'Bad email';
+    else if (seen.has(name.toLowerCase())) err = existing.some(n => n.toLowerCase() === name.toLowerCase()) ? 'Already in roster' : 'Repeated in file';
+    if (!err) seen.add(name.toLowerCase());
+    out.items.push({ line: i + 2, name, email, err });
+  });
+  if (!out.items.length) out.problem = 'The file has a header but no students.';
+  return out;
+}
+function importCsvDialog(cid) {
+  const existing = (State.members[cid] ? State.members[cid].list : []).filter(x => !x.removed).map(x => x.name);
+  let good = [];
+  openModal({
+    title: 'Import students from CSV',
+    body: '<div id="f-formerr"></div><p class="muted small">Choose a .csv file with a header line, like <b>Name,Email</b>. Email is optional. In Excel or Google Sheets use Save as / Download as CSV. Nothing is saved until you confirm.</p>' +
+      '<input class="input" id="f-csv" type="file" accept=".csv,text/csv,.txt"><div id="csv-preview" style="margin-top:12px"></div>',
+    actions: [{ label: 'Cancel' }, {
+      label: 'Import', cls: 'btn-primary',
+      onClick() {
+        if (!good.length) { showFormErr('Choose a file with at least one valid student first.'); return false; }
+        runDialog(() => B.addStudents(cid, good), async n => { toast(n + ' student' + (n === 1 ? '' : 's') + ' imported.', 'ok'); await fetchMembers(cid); }, 'Importing…');
+        return false;
+      }
+    }]
+  });
+  const inp = $('#f-csv'); if (!inp) return;
+  inp.addEventListener('change', async () => {
+    const box = $('#csv-preview'); good = []; showFormErr('');
+    const f = inp.files && inp.files[0]; if (!f) { box.innerHTML = ''; return; }
+    if (f.size > 1024 * 1024) { box.innerHTML = '<div class="notice bad">That file is too large (1 MB at most).</div>'; return; }
+    let text; try { text = await f.text(); } catch (e) { box.innerHTML = '<div class="notice bad">Could not read that file.</div>'; return; }
+    const r = checkImport(parseCsv(text), existing);
+    if (r.problem) { box.innerHTML = '<div class="notice bad">' + plainEsc(r.problem) + '</div>'; return; }
+    good = r.items.filter(x => !x.err).map(x => ({ name: x.name, email: x.email }));
+    const bad = r.items.filter(x => x.err);
+    box.innerHTML = '<div class="notice ' + (bad.length ? 'info' : 'ok') + '"><b>' + good.length + '</b> ready to import' + (bad.length ? ', <b>' + bad.length + '</b> will be skipped' : '') + '.</div>' +
+      '<div class="list" style="max-height:240px;overflow:auto;margin-top:8px">' + r.items.slice(0, 200).map(x =>
+        '<div class="item"><div class="grow" style="min-width:0"><b>' + plainEsc(x.name || '(blank)') + '</b><div class="muted small">Line ' + x.line + (x.email ? ' · ' + plainEsc(x.email) : '') + '</div></div><span class="chip ' + (x.err ? 'bad' : 'ok') + '">' + (x.err || 'OK') + '</span></div>').join('') + '</div>' +
+      (r.items.length > 200 ? '<p class="muted small">Showing the first 200 lines. All lines are checked.</p>' : '');
+  });
+}
+
 /* ---------- Phase 3: classes (real mode) ---------- */
-const BUILD = '3c-1';
+const BUILD = '3d-1';
 let modalLocked = false, opBusy = false;
 
 /* Loads the signed-in faculty member's classes. Quiet: it does not blank the page. */
@@ -641,7 +717,7 @@ const Actions = {
   'roster-edit': el => { const x = rosterEntry(el.dataset.cid, el.dataset.id, 'manual'); if (x) studentFormDialog(el.dataset.cid, x); },
   'roster-remove': el => { const x = rosterEntry(el.dataset.cid, el.dataset.id, el.dataset.kind); if (x) removeStudentDialog(el.dataset.cid, x); },
   'roster-restore': el => { const x = rosterEntry(el.dataset.cid, el.dataset.id, el.dataset.kind); if (x) restoreStudentNow(el.dataset.cid, x); },
-  'roster-import': () => openModal({ title: 'Import students', body: '<div class="notice">Importing a CSV file, with a preview and checks for blank names and duplicates, is the next step (3d). For now, use Add student.</div>', actions: [{ label: 'Got it', cls: 'btn-primary' }] }),
+  'roster-import': el => importCsvDialog(el.dataset.id),
   'cancel-join': el => { const j = State.myJoin.find(x => x.id === el.dataset.id); if (j) cancelJoinDialog(j); },
   'reload-requests': () => {
     State.jr = { status: 'idle', error: null }; State.myJ = { status: 'idle', error: null }; State.members = {}; refresh();
