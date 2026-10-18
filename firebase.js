@@ -404,6 +404,22 @@
       await fsM.addDoc(fsM.collection(db, 'classes', classId, 'students'), { name, email, removed: false, createdAt: fsM.serverTimestamp() });
     } catch (e) { throw joinErr(e); }
   }
+  /* Bulk add (CSV import). rows = [{name, email}], already checked by the screen; checked again here. Chunks of 400. */
+  async function addStudents(classId, rows) {
+    let done = 0;
+    try {
+      const { db, fsM } = fb; meUid();
+      if (!Array.isArray(rows) || !rows.length) throw appErr('There are no students to import.');
+      if (rows.length > 1000) throw appErr('Import at most 1000 students at a time.');
+      const clean = rows.map(r => { const name = cleanName(r.name), email = cleanEmail(r.email); checkStudent(name, email); return { name, email }; });
+      for (let i = 0; i < clean.length; i += 400) {
+        const batch = fsM.writeBatch(db);
+        clean.slice(i, i + 400).forEach(r => batch.set(fsM.doc(fsM.collection(db, 'classes', classId, 'students')), { name: r.name, email: r.email, removed: false, createdAt: fsM.serverTimestamp() }));
+        await batch.commit(); done += Math.min(400, clean.length - i);
+      }
+      return done;
+    } catch (e) { const x = joinErr(e); x.imported = done; throw x; }
+  }
   /* Edit the name/email of a hand-added student. Joined students' details come from their own account and stay as they sent them. */
   async function updateStudent(classId, id, nameRaw, emailRaw) {
     try {
@@ -441,5 +457,5 @@
 
   window.AttendrixBackend = { init, onAuth, signIn, signOut, syncProfile, loadRoles, inspectRoles, isConfigured, probeRules,
     listClasses, createClass, updateClass, setClassStatus, resetClassPassword,
-    requestJoin, listMyRequests, cancelRequest, listPendingRequests, listMembers, addStudent, updateStudent, setStudentRemoved, decideRequest, _derive: derive, _newSecret: newSecret };
+    requestJoin, listMyRequests, cancelRequest, listPendingRequests, listMembers, addStudent, addStudents, updateStudent, setStudentRemoved, decideRequest, _derive: derive, _newSecret: newSecret };
 })();
