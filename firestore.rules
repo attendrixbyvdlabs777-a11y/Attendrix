@@ -1,6 +1,6 @@
 rules_version = '2';
 
-// ATTENDRIX – Firestore security rules (Phase 3, steps 3a-3c: classes, join requests, members, roster)
+// ATTENDRIX – Firestore security rules (Phases 3-4: classes, enrollment, roster, attendance, audit)
 // Default is DENY. Only the rules below grant access; everything else stays closed.
 // Later steps add explicit rules for join requests, rosters, attendance, chat, etc.
 //
@@ -28,9 +28,17 @@ service cloud.firestore {
     // True only for a signed-in user whose roles/{uid} document lists "faculty".
     // Roles are written by an administrator in the console, never from a browser.
     // If the document or its "roles" field is missing, the rule errors and the request is denied.
-    function isFaculty() {
+    function rolesPath(uid) {
+      return /databases/$(database)/documents/roles/$(uid);
+    }
+    // Never errors: a missing roles document simply means "no staff roles".
+    function hasRole(r) {
       return signedIn()
-        && get(/databases/$(database)/documents/roles/$(request.auth.uid)).data.roles.hasAny(['faculty']);
+        && exists(rolesPath(request.auth.uid))
+        && get(rolesPath(request.auth.uid)).data.get('roles', []).hasAny([r]);
+    }
+    function isFaculty() {
+      return hasRole('faculty');
     }
     function classPath(id) {
       return /databases/$(database)/documents/classes/$(id);
@@ -65,6 +73,39 @@ service cloud.firestore {
     }
     function memberPath(classId, uid) {
       return /databases/$(database)/documents/classes/$(classId)/members/$(uid);
+    }
+    function crPath(classId, uid) {
+      return /databases/$(database)/documents/crAssignments/$(classId + '_' + uid);
+    }
+    function sessionPath(classId, sid) {
+      return /databases/$(database)/documents/classes/$(classId)/sessions/$(sid);
+    }
+    function recordPath(classId, sid, key) {
+      return /databases/$(database)/documents/classes/$(classId)/sessions/$(sid)/records/$(key);
+    }
+    function corrPath(classId, sid, id) {
+      return /databases/$(database)/documents/classes/$(classId)/sessions/$(sid)/corrections/$(id);
+    }
+    function auditPath(id) {
+      return /databases/$(database)/documents/auditLogs/$(id);
+    }
+    // The faculty member who owns the class.
+    function isClassOwner(classId) {
+      return isFaculty() && get(classPath(classId)).data.ownerUid == request.auth.uid;
+    }
+    // A Class Representative: has the "cr" role (set by an administrator) AND was assigned to this class by its owner.
+    function isClassCr(classId) {
+      return hasRole('cr') && exists(crPath(classId, request.auth.uid));
+    }
+    // Faculty owner or assigned CR: may run attendance for the class.
+    function isStaff(classId) {
+      return isClassOwner(classId) || isClassCr(classId);
+    }
+    // An enrolled student who has not been removed.
+    function isActiveMember(classId) {
+      return signedIn()
+        && exists(memberPath(classId, request.auth.uid))
+        && get(memberPath(classId, request.auth.uid)).data.get('removed', false) != true;
     }
 
     // Each user can read and maintain only their own profile.
@@ -219,7 +260,7 @@ service cloud.firestore {
       allow get: if signedIn()
         && (request.auth.uid == uid
             || (isFaculty() && get(classPath(classId)).data.ownerUid == request.auth.uid));
-      allow list: if isFaculty() && get(classPath(classId)).data.ownerUid == request.auth.uid;
+      allow list: if isStaff(classId);
       allow create: if isFaculty()
         && get(classPath(classId)).data.ownerUid == request.auth.uid
         && request.resource.data.keys().hasOnly(['studentUid', 'displayName', 'email', 'photoURL', 'joinedAt'])
@@ -243,7 +284,7 @@ service cloud.firestore {
     // ---- Students added by hand (no account yet) --------------------------------
     // Owner only. Removal is a flag, never a delete, so records stay.
     match /classes/{classId}/students/{sid} {
-      allow get, list: if isFaculty() && get(classPath(classId)).data.ownerUid == request.auth.uid;
+      allow get, list: if isStaff(classId);
       allow create: if isFaculty()
         && get(classPath(classId)).data.ownerUid == request.auth.uid
         && request.resource.data.keys().hasOnly(['name', 'email', 'removed', 'createdAt'])
@@ -261,6 +302,161 @@ service cloud.firestore {
         && request.resource.data.email is string && request.resource.data.email.size() <= 200
         && request.resource.data.removed is bool;
       allow delete: if false;
+    }
+
+    // ---- Class representatives -------------------------------------------------
+    // The class owner assigns an enrolled student as CR for this class. This never changes roles/{uid}
+    // (only an administrator can do that); the CR tools work only if BOTH exist.
+    match /crAssignments/{aid} {
+      allow get, list: if signedIn() && (resource.data.crUid == request.auth.uid || resource.data.ownerUid == request.auth.uid);
+      allow create: if isFaculty()
+        && request.resource.data.keys().hasOnly(['classId', 'crUid', 'crName', 'className', 'ownerUid', 'createdAt'])
+        && request.resource.data.keys().hasAll(['classId', 'crUid', 'crName', 'className', 'ownerUid', 'createdAt'])
+        && request.resource.data.classId is string && request.resource.data.crUid is string
+        && aid == request.resource.data.classId + '_' + request.resource.data.crUid
+        && isClassOwner(request.resource.data.classId)
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.className == get(classPath(request.resource.data.classId)).data.name
+        && request.resource.data.crName is string && request.resource.data.crName.size() <= 120
+        && request.resource.data.createdAt == request.time
+        && exists(memberPath(request.resource.data.classId, request.resource.data.crUid));
+      allow update: if false;
+      allow delete: if isClassOwner(resource.data.classId);
+    }
+
+    // ---- Attendance sessions ----------------------------------------------------
+    // Session id = "<YYYY-MM-DD>_<number>", so two sessions can never share a date and number.
+    // draft -> finalized (faculty or CR, with a matching audit entry in the same batch)
+    // finalized/corrected -> corrected (faculty owner only, with a correction record and audit entry).
+    match /classes/{classId}/sessions/{sid} {
+      allow get: if isStaff(classId)
+        || (resource.data.status in ['finalized', 'corrected'] && isActiveMember(classId));
+      allow list: if isStaff(classId)
+        || (resource.data.status in ['finalized', 'corrected'] && isActiveMember(classId));
+      allow create: if isStaff(classId)
+        && get(classPath(classId)).data.status == 'active'
+        && request.resource.data.keys().hasOnly(['date', 'number', 'title', 'status', 'createdBy', 'createdByName', 'createdAt', 'rosterSize'])
+        && request.resource.data.keys().hasAll(['date', 'number', 'title', 'status', 'createdBy', 'createdByName', 'createdAt', 'rosterSize'])
+        && request.resource.data.date is string && request.resource.data.date.matches('^20[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$')
+        && request.resource.data.number is int && request.resource.data.number >= 1 && request.resource.data.number <= 20
+        && sid.matches('^' + request.resource.data.date + '_[0-9]{1,2}$')
+        && int(sid.split('_')[1]) == request.resource.data.number
+        && request.resource.data.title is string && request.resource.data.title.size() <= 80
+        && request.resource.data.status == 'draft'
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdByName is string && request.resource.data.createdByName.size() <= 120
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.rosterSize is int && request.resource.data.rosterSize >= 0 && request.resource.data.rosterSize <= 450;
+      // Rename a draft.
+      allow update: if isStaff(classId)
+        && resource.data.status == 'draft'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['title'])
+        && request.resource.data.title is string && request.resource.data.title.size() <= 80;
+      // Finalize a draft. The audit entry must be written in the same batch.
+      allow update: if isStaff(classId)
+        && resource.data.status == 'draft'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'finalizedAt', 'finalizedBy'])
+        && request.resource.data.status == 'finalized'
+        && request.resource.data.finalizedAt == request.time
+        && request.resource.data.finalizedBy == request.auth.uid
+        && existsAfter(auditPath('fin_' + classId + '_' + sid))
+        && getAfter(auditPath('fin_' + classId + '_' + sid)).data.action == 'attendance.finalize'
+        && getAfter(auditPath('fin_' + classId + '_' + sid)).data.actorUid == request.auth.uid;
+      // Record a correction on a finalized session (faculty owner only).
+      allow update: if isClassOwner(classId)
+        && resource.data.status in ['finalized', 'corrected']
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'correctedAt', 'lastCorrection', 'correctionCount'])
+        && request.resource.data.status == 'corrected'
+        && request.resource.data.correctedAt == request.time
+        && request.resource.data.correctionCount == resource.data.get('correctionCount', 0) + 1
+        && request.resource.data.lastCorrection is string
+        && existsAfter(corrPath(classId, sid, request.resource.data.lastCorrection))
+        && !exists(corrPath(classId, sid, request.resource.data.lastCorrection));
+      // Only drafts can be discarded.
+      allow delete: if isStaff(classId) && resource.data.status == 'draft';
+
+      // One record per student per session: the id is the student key, so duplicates are impossible.
+      // Records are created only in the batch that creates the session, with everyone present.
+      match /records/{key} {
+        allow get: if isStaff(classId) || (key == 'm_' + request.auth.uid && isActiveMember(classId));
+        allow list: if isStaff(classId);
+        allow create: if isStaff(classId)
+          && !exists(sessionPath(classId, sid))
+          && existsAfter(sessionPath(classId, sid))
+          && request.resource.data.keys().hasOnly(['studentKey', 'name', 'roll', 'uid', 'status', 'updatedAt'])
+          && request.resource.data.keys().hasAll(['studentKey', 'name', 'roll', 'uid', 'status', 'updatedAt'])
+          && request.resource.data.studentKey == key
+          && ((key.matches('^m_[A-Za-z0-9]+$') && request.resource.data.uid == key.split('_')[1])
+              || (key.matches('^s_[A-Za-z0-9]+$') && request.resource.data.uid == null))
+          && request.resource.data.name is string && request.resource.data.name.size() >= 1 && request.resource.data.name.size() <= 120
+          && request.resource.data.roll is int && request.resource.data.roll >= 1 && request.resource.data.roll <= 2000
+          && request.resource.data.status == 'present'
+          && request.resource.data.updatedAt == request.time;
+        // Marking while the session is a draft.
+        allow update: if isStaff(classId)
+          && get(sessionPath(classId, sid)).data.status == 'draft'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          && request.resource.data.status in ['present', 'absent', 'late', 'excused']
+          && request.resource.data.updatedAt == request.time;
+        // Changing a finalized record: only through a correction (original, revised, reason, actor kept).
+        allow update: if isClassOwner(classId)
+          && get(sessionPath(classId, sid)).data.status in ['finalized', 'corrected']
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'lastCorrection', 'updatedAt'])
+          && request.resource.data.status in ['present', 'absent', 'late', 'excused']
+          && request.resource.data.status != resource.data.status
+          && request.resource.data.updatedAt == request.time
+          && request.resource.data.lastCorrection is string
+          && !exists(corrPath(classId, sid, request.resource.data.lastCorrection))
+          && getAfter(corrPath(classId, sid, request.resource.data.lastCorrection)).data.studentKey == key
+          && getAfter(corrPath(classId, sid, request.resource.data.lastCorrection)).data.from == resource.data.status
+          && getAfter(corrPath(classId, sid, request.resource.data.lastCorrection)).data.to == request.resource.data.status
+          && existsAfter(auditPath('cor_' + request.resource.data.lastCorrection))
+          && getAfter(auditPath('cor_' + request.resource.data.lastCorrection)).data.action == 'attendance.correct';
+        allow delete: if isStaff(classId) && get(sessionPath(classId, sid)).data.status == 'draft';
+      }
+
+      // Correction history: written once, never edited or deleted.
+      match /corrections/{cid} {
+        allow get, list: if isStaff(classId);
+        allow create: if isClassOwner(classId)
+          && request.resource.data.keys().hasOnly(['studentKey', 'from', 'to', 'reason', 'actorUid', 'actorName', 'at'])
+          && request.resource.data.keys().hasAll(['studentKey', 'from', 'to', 'reason', 'actorUid', 'actorName', 'at'])
+          && request.resource.data.from in ['present', 'absent', 'late', 'excused']
+          && request.resource.data.to in ['present', 'absent', 'late', 'excused']
+          && request.resource.data.from != request.resource.data.to
+          && request.resource.data.reason is string && request.resource.data.reason.size() >= 5 && request.resource.data.reason.size() <= 300
+          && request.resource.data.actorUid == request.auth.uid
+          && request.resource.data.actorName is string && request.resource.data.actorName.size() <= 120
+          && request.resource.data.at == request.time
+          && getAfter(recordPath(classId, sid, request.resource.data.studentKey)).data.lastCorrection == cid;
+        allow update, delete: if false;
+      }
+    }
+
+    // ---- Audit log --------------------------------------------------------------
+    // Append-only: nobody can edit or delete an entry. The actor is always the signed-in user. Entries for
+    // finalizing and correcting attendance are REQUIRED by the rules above, so those cannot happen unlogged.
+    // Honest limit: other entries are written by the browser after the action, so a faculty member could
+    // skip one; only a Cloud Function (needs the Blaze plan) can make logging unavoidable for everything.
+    match /auditLogs/{aid} {
+      allow read: if isFaculty() && resource.data.ownerUid == request.auth.uid;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['classId', 'ownerUid', 'actorUid', 'actorName', 'action', 'targetType', 'targetId', 'meta', 'at'])
+        && request.resource.data.keys().hasAll(['classId', 'ownerUid', 'actorUid', 'actorName', 'action', 'targetType', 'targetId', 'meta', 'at'])
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.actorName is string && request.resource.data.actorName.size() <= 120
+        && request.resource.data.classId is string
+        && request.resource.data.ownerUid == get(classPath(request.resource.data.classId)).data.ownerUid
+        && isStaff(request.resource.data.classId)
+        && request.resource.data.action in ['class.create', 'class.update', 'class.archive', 'class.restore', 'class.password-reset',
+             'enrollment.approve', 'enrollment.reject', 'roster.add', 'roster.import', 'roster.remove', 'roster.restore',
+             'cr.assign', 'cr.unassign', 'attendance.session-create', 'attendance.finalize', 'attendance.correct',
+             'request.decide', 'announcement.create', 'announcement.update']
+        && request.resource.data.targetType is string && request.resource.data.targetType.size() <= 30
+        && request.resource.data.targetId is string && request.resource.data.targetId.size() <= 120
+        && request.resource.data.meta is map && request.resource.data.meta.keys().size() <= 8
+        && request.resource.data.at == request.time;
+      allow update, delete: if false;
     }
 
     // Everything else: denied.
